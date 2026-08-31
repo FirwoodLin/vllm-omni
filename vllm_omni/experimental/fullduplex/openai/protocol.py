@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import copy
@@ -9,7 +12,6 @@ from uuid import uuid4
 
 
 class DuplexOverlapPolicy(str, Enum):
-    AUTO = "auto"
     LISTEN_ONLY = "listen_only"
     BARGE_IN_ON_SPEECH = "barge_in_on_speech"
 
@@ -103,7 +105,7 @@ class DuplexCapabilities:
         supports_multi_session = max_sessions > 1
         return cls(
             supports_model_native_turn_policy=True,
-            supports_barge_in=False,
+            supports_barge_in=True,
             supports_input_append=True,
             supports_replace_latest_chunk=False,
             supports_reencode_context=False,
@@ -131,6 +133,8 @@ class DuplexCapabilities:
             signal_sources=["model_native", "client_event", "server_policy"],
             stage_handoff_transport="scheduler_data_plane",
             chunk_period_ms=1000,
+            # Barge-in latency depends on client chunking and lacks hardware E2E
+            # measurement, so do not advertise an invented target.
             target_barge_in_latency_ms=None,
         )
 
@@ -412,6 +416,8 @@ class ResponseState:
     active_request_id: str | None = None
     active_response_id: str | None = None
     active_response_turn_id: int | None = None
+    active_response_input_commit_seq: int | None = None
+    active_response_awaits_input_commit: bool = False
     last_response_id: str | None = None
     assistant_text_buffer: list[str] = field(default_factory=list)
     assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
@@ -438,9 +444,13 @@ class ConversationHistory:
     pending_item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
     pending_item_full_messages: dict[str, dict[str, object]] = field(default_factory=dict)
     pending_item_audio_text_marks: dict[str, list[DuplexAssistantAudioTextMark]] = field(default_factory=dict)
+    pending_item_input_commit_seqs: dict[str, int] = field(default_factory=dict)
     pending_truncations_ms: dict[str, int] = field(default_factory=dict)
     last_assistant_full_message: dict[str, object] | None = None
     last_assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
+    assistant_response_snapshots: dict[str, tuple[dict[str, object], tuple[DuplexAssistantAudioTextMark, ...], int]] = (
+        field(default_factory=dict)
+    )
 
 
 @dataclass
@@ -528,6 +538,26 @@ class DuplexSession:
     @property
     def last_assistant_audio_text_marks(self) -> tuple[DuplexAssistantAudioTextMark, ...]:
         return tuple(self._conversation.last_assistant_audio_text_marks)
+
+    def has_assistant_response_item(self, response_id: str, item_id: str) -> bool:
+        if item_id != f"item_{response_id}":
+            return False
+        if self.active_response_id == response_id:
+            return True
+        message = self._conversation.item_ids.get(item_id) or self._conversation.pending_item_ids.get(item_id)
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            return True
+        return response_id in self._conversation.assistant_response_snapshots
+
+    def playback_ack_is_too_late(self, response_id: str, item_id: str) -> bool:
+        input_commit_seq = self._conversation.pending_item_input_commit_seqs.get(item_id)
+        if input_commit_seq is None:
+            snapshot = self._conversation.assistant_response_snapshots.get(response_id)
+            if snapshot is not None:
+                input_commit_seq = snapshot[2]
+        if input_commit_seq is None and self.active_response_id == response_id:
+            input_commit_seq = self._response.active_response_input_commit_seq
+        return input_commit_seq is not None and self.input_commit_seq > input_commit_seq
 
     @property
     def playback(self) -> DuplexPlaybackView:
@@ -676,6 +706,7 @@ class DuplexSession:
         else:
             content = text
 
+        self._bind_active_response_to_input_commit(self._input.commit_seq + 1)
         self._input.commit_seq += 1
         message = {"role": "user", "content": content}
         self._conversation.messages.append(message)
@@ -702,6 +733,7 @@ class DuplexSession:
         }
         if transcript:
             input_audio_part["transcript"] = transcript
+        self._bind_active_response_to_input_commit(self._input.commit_seq + 1)
         self._input.commit_seq += 1
         message = {"role": "user", "content": [input_audio_part]}
         if transcript:
@@ -722,6 +754,11 @@ class DuplexSession:
         completed_turn_id = int(turn_id)
         if completed_turn_id >= self.turn_id:
             self.turn_id = completed_turn_id + 1
+
+    def _bind_active_response_to_input_commit(self, input_commit_seq: int) -> None:
+        if self.active_response_id is not None and self._response.active_response_awaits_input_commit:
+            self._response.active_response_input_commit_seq = int(input_commit_seq)
+            self._response.active_response_awaits_input_commit = False
 
     def reserve_response_options(self, options: ResponseCreateOptions) -> None:
         if self._response.active_response_id is not None:
@@ -751,6 +788,8 @@ class DuplexSession:
         response_id = f"resp-{self.session_id}-{self.epoch}-{uuid4().hex[:8]}"
         self._response.active_response_id = response_id
         self._response.active_response_turn_id = self.turn_id if turn_id is None else int(turn_id)
+        self._response.active_response_input_commit_seq = self.input_commit_seq
+        self._response.active_response_awaits_input_commit = self.turn_state == DuplexTurnState.USER_SPEAKING
         self._response.last_response_id = response_id
         self._response.assistant_text_buffer.clear()
         self._response.assistant_audio_text_marks.clear()
@@ -852,6 +891,23 @@ class DuplexSession:
                 if name not in handled_fields:
                     current[str(name)] = copy.deepcopy(value)
 
+        return copy.deepcopy(self._response.stage_metrics)
+
+    def replace_response_stage_metric_snapshots(
+        self,
+        stage_metrics: Mapping[object, object] | None,
+    ) -> dict[str, dict[str, object]]:
+        """Merge cumulative chat snapshots by replacing each stage's latest value."""
+        if self.active_response_id is None or not isinstance(stage_metrics, Mapping):
+            return copy.deepcopy(self._response.stage_metrics)
+
+        for raw_stage_id, raw_values in stage_metrics.items():
+            if not isinstance(raw_values, Mapping):
+                continue
+            stage_id = str(raw_stage_id)
+            self._response.stage_metrics[stage_id] = copy.deepcopy(dict(raw_values))
+            self._response.stage_metric_tpot_weighted_ms.pop(stage_id, None)
+            self._response.stage_metric_tpot_weight.pop(stage_id, None)
         return copy.deepcopy(self._response.stage_metrics)
 
     def accumulate_overlap_speech(self, duration_ms: int) -> int:
@@ -1048,12 +1104,23 @@ class DuplexSession:
         playback_commit_policy: str | None = None,
         preserve_request: bool = False,
     ) -> dict[str, object] | None:
+        response_id = self._response.active_response_id
+        response_input_commit_seq = self._response.active_response_input_commit_seq
+        if response_input_commit_seq is None:
+            response_input_commit_seq = self.input_commit_seq
+        response_history_is_late = self.input_commit_seq > response_input_commit_seq
         assistant_text = "".join(self._response.assistant_text_buffer).strip()
         message = None
         if assistant_text:
             self._conversation.last_assistant_full_message = {"role": "assistant", "content": assistant_text}
             self._conversation.last_assistant_audio_text_marks = list(self._response.assistant_audio_text_marks)
-        if commit_text and assistant_text:
+            if response_id is not None:
+                self._conversation.assistant_response_snapshots[response_id] = (
+                    copy.deepcopy(self._conversation.last_assistant_full_message),
+                    tuple(copy.deepcopy(self._response.assistant_audio_text_marks)),
+                    response_input_commit_seq,
+                )
+        if commit_text and assistant_text and not response_history_is_late:
             committed_text = self._playback_committed_text(
                 assistant_text,
                 playback_commit_policy=playback_commit_policy,
@@ -1063,11 +1130,21 @@ class DuplexSession:
         if commit_text and committed_text:
             message = {"role": "assistant", "content": committed_text}
             self._conversation.messages.append(message)
+        effective_playback_policy = playback_commit_policy or self.config.playback_commit_policy
+        if (
+            response_id is not None
+            and assistant_text
+            and message is None
+            and effective_playback_policy == DuplexPlaybackCommitPolicy.ACK_ONLY.value
+        ):
+            self.register_history_item(f"item_{response_id}", None)
         self._response.assistant_text_buffer.clear()
         if not preserve_request:
             self._response.active_request_id = None
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
+        self._response.active_response_input_commit_seq = None
+        self._response.active_response_awaits_input_commit = False
         self._clear_response_metrics()
         self.turn_state = DuplexTurnState.IDLE
         self._restore_response_config()
@@ -1076,17 +1153,21 @@ class DuplexSession:
     def register_history_item(self, item_id: str | None, message: dict[str, object] | None) -> None:
         if not item_id:
             return
+        response_id = item_id.removeprefix("item_") if item_id.startswith("item_") else None
+        response_snapshot = (
+            self._conversation.assistant_response_snapshots.get(response_id) if response_id is not None else None
+        )
+        response_audio_text_marks = list(response_snapshot[1]) if response_snapshot is not None else None
         if message is None:
-            last_message = self._conversation.last_assistant_full_message
-            if last_message is None:
+            if response_snapshot is None:
                 return
+            last_message, audio_text_marks, _ = response_snapshot
             full_message = copy.deepcopy(last_message)
             self._conversation.pending_item_ids[item_id] = copy.deepcopy(full_message)
             self._conversation.pending_item_full_messages[item_id] = full_message
-            if self._conversation.last_assistant_audio_text_marks:
-                self._conversation.pending_item_audio_text_marks[item_id] = list(
-                    self._conversation.last_assistant_audio_text_marks
-                )
+            self._conversation.pending_item_input_commit_seqs[item_id] = response_snapshot[2]
+            if audio_text_marks:
+                self._conversation.pending_item_audio_text_marks[item_id] = list(copy.deepcopy(audio_text_marks))
             pending_audio_ms = self._conversation.pending_truncations_ms.pop(item_id, None)
             if pending_audio_ms is not None:
                 self.truncate_history_item(
@@ -1095,7 +1176,11 @@ class DuplexSession:
                     playback=self._playback_cursor_for_item_id(item_id),
                 )
             return
-        full_message = copy.deepcopy(self._conversation.last_assistant_full_message or message)
+        full_message = copy.deepcopy(
+            response_snapshot[0]
+            if response_snapshot is not None
+            else self._conversation.last_assistant_full_message or message
+        )
         self._conversation.item_full_messages[item_id] = full_message
         if message.get("role") == "assistant":
             marks = self._response.assistant_audio_text_marks or self._conversation.last_assistant_audio_text_marks
@@ -1107,7 +1192,11 @@ class DuplexSession:
             self._truncate_message_to_audio_ms(
                 candidate,
                 audio_end_ms=pending_audio_ms,
-                marks=self._response.assistant_audio_text_marks or self._conversation.last_assistant_audio_text_marks,
+                marks=(
+                    response_audio_text_marks
+                    if response_audio_text_marks is not None
+                    else self._response.assistant_audio_text_marks or self._conversation.last_assistant_audio_text_marks
+                ),
                 playback=self._playback_cursor_for_item_id(item_id),
             )
             self._replace_history_message(message, candidate)
@@ -1122,15 +1211,30 @@ class DuplexSession:
         self._conversation.pending_item_ids.pop(item_id, None)
         self._conversation.pending_item_full_messages.pop(item_id, None)
         self._conversation.pending_item_audio_text_marks.pop(item_id, None)
+        self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
+        if response_id is not None:
+            self._conversation.assistant_response_snapshots.pop(response_id, None)
+        if message.get("role") == "assistant":
+            marks = (
+                response_audio_text_marks
+                if response_audio_text_marks is not None
+                else self._response.assistant_audio_text_marks or self._conversation.last_assistant_audio_text_marks
+            )
+            if marks:
+                self._conversation.item_audio_text_marks[item_id] = list(marks)
 
     def delete_history_item(self, item_id: str) -> bool:
+        response_id = item_id.removeprefix("item_") if item_id.startswith("item_") else None
         message = self._conversation.item_ids.pop(item_id, None)
         self._conversation.item_full_messages.pop(item_id, None)
         self._conversation.item_audio_text_marks.pop(item_id, None)
         pending = self._conversation.pending_item_ids.pop(item_id, None)
         self._conversation.pending_item_full_messages.pop(item_id, None)
         self._conversation.pending_item_audio_text_marks.pop(item_id, None)
+        self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
         self._conversation.pending_truncations_ms.pop(item_id, None)
+        if response_id is not None:
+            self._conversation.assistant_response_snapshots.pop(response_id, None)
         if message is None:
             return pending is not None
         try:
@@ -1168,6 +1272,14 @@ class DuplexSession:
                 playback=playback,
             )
             if not changed or self._message_text_len(message) <= 0:
+                if changed:
+                    self._conversation.pending_item_ids.pop(item_id, None)
+                    self._conversation.pending_item_full_messages.pop(item_id, None)
+                    self._conversation.pending_item_audio_text_marks.pop(item_id, None)
+                    self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
+                    self._conversation.pending_truncations_ms.pop(item_id, None)
+                    if item_id.startswith("item_"):
+                        self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
                 return changed
             self._conversation.messages.append(message)
             self._conversation.item_ids[item_id] = message
@@ -1179,7 +1291,10 @@ class DuplexSession:
             self._conversation.pending_item_ids.pop(item_id, None)
             self._conversation.pending_item_full_messages.pop(item_id, None)
             self._conversation.pending_item_audio_text_marks.pop(item_id, None)
+            self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
             self._conversation.pending_truncations_ms.pop(item_id, None)
+            if item_id.startswith("item_"):
+                self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
             return True
         full_message = self._conversation.item_full_messages.get(item_id, message)
         candidate = copy.deepcopy(full_message)
@@ -1198,6 +1313,10 @@ class DuplexSession:
                 self._conversation.messages.remove(candidate)
             except ValueError:
                 pass
+            if item_id.startswith("item_"):
+                self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
+        elif changed and item_id.startswith("item_"):
+            self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
         return changed
 
     def _replace_history_message(
@@ -1355,6 +1474,8 @@ class DuplexSession:
         self._response.active_request_id = None
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
+        self._response.active_response_input_commit_seq = None
+        self._response.active_response_awaits_input_commit = False
         self._clear_response_metrics()
         self._restore_response_config()
         self.turn_state = DuplexTurnState.BARGE_IN
@@ -1368,6 +1489,8 @@ class DuplexSession:
         self.state = DuplexSessionState.CLOSED
         self.turn_state = DuplexTurnState.IDLE
         self._response.active_response_turn_id = None
+        self._response.active_response_input_commit_seq = None
+        self._response.active_response_awaits_input_commit = False
         self._clear_response_metrics()
         self._restore_response_config()
 

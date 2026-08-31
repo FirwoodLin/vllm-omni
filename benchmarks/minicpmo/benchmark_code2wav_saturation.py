@@ -111,16 +111,15 @@ def _metadata(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
 
 def _cfm_graph_cache_info(backend: BatchedToken2Wav) -> dict[str, int] | None:
     wrapper = getattr(backend, "_cfm_graph_wrapper", None)
-    capture_graph = getattr(wrapper, "_capture_graph", None)
-    cache_info = getattr(capture_graph, "cache_info", None)
-    if not callable(cache_info):
+    stats_snapshot = getattr(wrapper, "stats_snapshot", None)
+    if not callable(stats_snapshot):
         return None
-    info = cache_info()
+    stats = stats_snapshot()
     return {
-        "hits": int(info.hits),
-        "misses": int(info.misses),
-        "size": int(info.currsize),
-        "maxsize": int(info.maxsize),
+        "hits": int(stats["hits"]),
+        "misses": int(stats["captures"]),
+        "size": int(stats["cache_size"]),
+        "maxsize": int(wrapper.max_graphs),
     }
 
 
