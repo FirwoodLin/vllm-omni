@@ -58,6 +58,36 @@ def _small_hift() -> HiFTGenerator:
     return hift.eval().cuda()
 
 
+def test_hift_graph_accepts_configured_lazy_graph_limit() -> None:
+    parameter = nn.Parameter(torch.zeros(1))
+    hift = SimpleNamespace(
+        inference=Mock(),
+        _inference_pre_istft=Mock(),
+        _finalize_decode=Mock(),
+        conv_pre=SimpleNamespace(in_channels=80),
+        parameters=lambda: iter((parameter,)),
+    )
+    token2wav = SimpleNamespace(
+        hift=hift,
+        flow=SimpleNamespace(
+            encoder=SimpleNamespace(pre_lookahead_layer=SimpleNamespace(pre_lookahead_len=3)),
+            token_mel_ratio=2,
+        ),
+        mel_cache_len=2,
+        source_cache_len=960,
+    )
+
+    wrapper = HiFTGraphWrapper(
+        token2wav,
+        connector_config={"codec_chunk_frames": 2, "codec_left_context_frames": 3},
+        capture_batch_sizes=[1, 2],
+        max_lazy_graphs=23,
+    )
+
+    assert wrapper.capture_batch_sizes == [1, 2]
+    assert wrapper.max_lazy_graphs == 23
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_hift_graph_replay_matches_eager_for_uncached_and_cached_shapes() -> None:
     torch.manual_seed(0)
@@ -257,6 +287,12 @@ def _cfm_mock_wrapper(monkeypatch: pytest.MonkeyPatch, *, max_graphs: int = 1) -
     wrapper.max_graphs = max_graphs
     wrapper.graph_fn = Mock(return_value=torch.tensor([42.0]))
     wrapper.device = torch.device("cuda")
+    wrapper._cached_keys = set()
+    wrapper._overflow_keys = set()
+    wrapper._overflow_shape_count = 0
+    wrapper._replay_count = 0
+    wrapper._graph_replay_count = 0
+    wrapper._capture_failure_replay_count = 0
 
     @lru_cache(maxsize=max_graphs)
     def _capture_graph(key: tuple):
@@ -290,8 +326,8 @@ def test_cfm_capture_failure_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_cfm_lru_eviction(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify that LRU cache evicts oldest entries when full."""
+def test_cfm_full_cache_retains_graphs_and_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unseen shapes use eager after the graph cache reaches its limit."""
     pool = torch.cuda.graph_pool_handle()
     monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
 
@@ -314,12 +350,25 @@ def test_cfm_lru_eviction(monkeypatch: pytest.MonkeyPatch) -> None:
         inputs_c = _cfm_inputs(2, 14, 0)
         wrapper.replay(*inputs_c)
         assert wrapper._capture_graph.cache_info().currsize == 2
+        assert len(wrapper._cached_keys) == 2
+        assert wrapper._overflow_shape_count == 1
+        assert len(wrapper._overflow_keys) == 1
 
         wrapper.replay(*inputs_b)
         hits_before = wrapper._capture_graph.cache_info().hits
         wrapper.replay(*inputs_b)
         hits_after = wrapper._capture_graph.cache_info().hits
         assert hits_after == hits_before + 1
+        assert wrapper.cache_stats() == {
+            "total_replays": 6,
+            "graph_replays": 5,
+            "eager_overflow_replays": 1,
+            "eager_capture_failure_replays": 0,
+            "cached_shapes": 2,
+            "overflow_shapes": 1,
+            "cache_hits": hits_after,
+            "capture_attempts": 2,
+        }
 
     wrapper._capture_graph.cache_clear()
 

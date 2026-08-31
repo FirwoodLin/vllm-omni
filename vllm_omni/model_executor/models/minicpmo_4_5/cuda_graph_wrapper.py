@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from functools import lru_cache
 
 import torch
@@ -12,7 +13,13 @@ logger = init_logger(__name__)
 
 
 class HiFTGraphWrapper:
-    def __init__(self, token2wav, connector_config, capture_batch_sizes):
+    def __init__(
+        self,
+        token2wav,
+        connector_config,
+        capture_batch_sizes,
+        max_lazy_graphs: int = 8,
+    ):
         self.decode_fn = token2wav.hift.inference
         self.graph_fn = token2wav.hift._inference_pre_istft
         self.finalize_fn = token2wav.hift._finalize_decode
@@ -36,7 +43,9 @@ class HiFTGraphWrapper:
         parameter = next(token2wav.hift.parameters())
         self.device = parameter.device
         self.dtype = parameter.dtype
-        self.max_lazy_graphs = 8
+        self.max_lazy_graphs = int(max_lazy_graphs)
+        if self.max_lazy_graphs < 0:
+            raise ValueError("HiFT max_lazy_graphs must be non-negative")
         self.lazy_graph_count = 0
 
     def derive_capture_bucket_size(self):
@@ -166,21 +175,53 @@ class CFMGraphWrapper:
     as the graph target. The 10-step Euler loop stays in Python, replaying
     the graph 10 times per decode.
 
-    Uses functools.lru_cache for automatic LRU eviction. Cache misses
-    trigger capture; capture failures fall back to eager. Outputs are
-    cloned after replay to prevent streaming cache corruption.
+    Cache misses trigger capture until ``max_graphs`` is reached; unseen
+    shapes then fall back to eager while existing graphs remain available.
+    CUDA graphs captured from a shared graph pool must not be evicted while
+    the process is live: releasing and recapturing pooled graphs can leave
+    later replays referring to reused graph-pool storage. Outputs are cloned
+    after replay to prevent streaming cache corruption.
     """
 
     def __init__(self, graph_fn, *, max_graphs: int = 32) -> None:
         self.graph_fn = graph_fn
         self.max_graphs = int(max_graphs)
+        if self.max_graphs < 1:
+            raise ValueError("CFM graph max_graphs must be positive")
         self.device = next(graph_fn.__self__.parameters()).device
+        self._cached_keys: set[tuple] = set()
+        self._overflow_keys: set[tuple] = set()
+        self._overflow_shape_count = 0
+        self._replay_count = 0
+        self._graph_replay_count = 0
+        self._capture_failure_replay_count = 0
 
         @lru_cache(maxsize=self.max_graphs)
         def _capture_graph(key: tuple):
-            return self._capture(key)
+            entry = self._capture(key)
+            self._cached_keys.add(key)
+            return entry
 
         self._capture_graph = _capture_graph
+
+    def cache_stats(self) -> dict[str, int]:
+        cache_info = self._capture_graph.cache_info()
+        return {
+            "total_replays": self._replay_count,
+            "graph_replays": self._graph_replay_count,
+            "eager_overflow_replays": self._overflow_shape_count,
+            "eager_capture_failure_replays": self._capture_failure_replay_count,
+            "cached_shapes": len(self._cached_keys),
+            "overflow_shapes": len(self._overflow_keys),
+            "cache_hits": cache_info.hits,
+            "capture_attempts": cache_info.misses,
+        }
+
+    def _maybe_log_cache_stats(self, *, force: bool = False) -> None:
+        # CFM uses ten Euler steps per decode, so this normally emits one exact
+        # snapshot per completed decode without adding per-step log volume.
+        if force or self._replay_count % 10 == 0:
+            logger.info("CFM CUDA Graph stats %s", json.dumps(self.cache_stats(), sort_keys=True))
 
     def _call_graph_fn(self, args: tuple[torch.Tensor, ...]) -> torch.Tensor:
         return self.graph_fn(args[0], args[1], None, args[2], args[3], args[4], args[5])
@@ -212,7 +253,7 @@ class CFMGraphWrapper:
         logger.info(
             "Captured CFM CUDA Graph for shape %s (cache=%d/%d, hits=%d, misses=%d)",
             key,
-            self._capture_graph.cache_info().currsize,
+            min(self._capture_graph.cache_info().currsize + 1, self.max_graphs),
             self.max_graphs,
             self._capture_graph.cache_info().hits,
             self._capture_graph.cache_info().misses,
@@ -235,10 +276,28 @@ class CFMGraphWrapper:
                 result = self._call_graph_fn(inputs)
             return result, inputs[4], inputs[5]
 
+        self._replay_count += 1
         key = ("estimator_step",) + tuple(_tensor_signature(v) for v in inputs)
+        cached_keys = getattr(self, "_cached_keys", None)
+        if cached_keys is not None and key not in cached_keys and len(cached_keys) >= self.max_graphs:
+            first_overflow = self._overflow_shape_count == 0
+            self._overflow_shape_count += 1
+            self._overflow_keys.add(key)
+            log = logger.warning if self._overflow_shape_count == 1 else logger.debug
+            log(
+                "CFM CUDA Graph cache is full (%d/%d); using eager for unseen shape %s while retaining captured graphs",
+                len(cached_keys),
+                self.max_graphs,
+                key,
+            )
+            with torch.no_grad():
+                result = self._call_graph_fn(inputs)
+            self._maybe_log_cache_stats(force=first_overflow)
+            return result, inputs[4], inputs[5]
         entry = self._capture_graph(key)
 
         if entry is None:
+            self._capture_failure_replay_count += 1
             logger.debug(
                 "CFM graph eager fallback for shape=%s (hits=%d, misses=%d)",
                 key,
@@ -247,12 +306,15 @@ class CFMGraphWrapper:
             )
             with torch.no_grad():
                 result = self._call_graph_fn(inputs)
+            self._maybe_log_cache_stats()
             return result, inputs[4], inputs[5]
 
         static_inputs, static_output, graph = entry
         for static, current in zip(static_inputs, inputs, strict=True):
             static.copy_(current)
         graph.replay()
+        self._graph_replay_count += 1
+        self._maybe_log_cache_stats()
         return (
             static_output.detach().clone(),
             static_inputs[4].detach().clone(),

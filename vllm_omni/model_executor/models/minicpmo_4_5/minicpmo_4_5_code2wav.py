@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -176,6 +177,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._hift_graph_config = {
             "enabled": bool(extra.get("enable_hift_graph", False)),
             "capture_batch_sizes": capture_batch_sizes,
+            "max_lazy_graphs": int(extra.get("hift_graph_max_lazy_graphs", 8)),
         }
         self._cfm_graph_config = {
             "enabled": bool(extra.get("enable_cfm_graph", False)),
@@ -716,6 +718,10 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
         for bucket in self._iter_decode_batches(buckets.values()):
             batch_size = len(bucket)
+            timing_enabled = os.environ.get("MINICPMO_CODE2WAV_TIMING", "0") == "1"
+            if timing_enabled:
+                torch.accelerator.synchronize()
+                decode_started = time.perf_counter()
             try:
                 features = self.backend.prepare_prompt(
                     bucket[0].prompt_cache_id,
@@ -752,6 +758,16 @@ class MiniCPMO45Code2Wav(nn.Module):
                     error_type=type(exc).__name__,
                     error=str(exc),
                 ) from exc
+            if timing_enabled:
+                torch.accelerator.synchronize()
+                logger.info(
+                    "MiniCPM-o Code2Wav timing batch=%d codec_lengths=%s chunk_seqs=%s last_chunks=%s decode_ms=%.3f",
+                    batch_size,
+                    sorted(int(item.tokens.numel()) for item in bucket),
+                    sorted(item.chunk_seq for item in bucket),
+                    sorted(item.last_chunk for item in bucket),
+                    (time.perf_counter() - decode_started) * 1000.0,
+                )
             if len(audios) != batch_size or len(next_states) != batch_size:
                 self._prune_unowned_runtime_prompts()
                 raise _batch_error(

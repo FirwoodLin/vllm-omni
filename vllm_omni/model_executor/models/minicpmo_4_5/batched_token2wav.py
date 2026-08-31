@@ -229,6 +229,7 @@ class BatchedToken2Wav(nn.Module):
                     token2wav=token2wav,
                     connector_config=dict(connector_config),
                     capture_batch_sizes=capture_batch_sizes,
+                    max_lazy_graphs=int(graph_config.get("max_lazy_graphs", 8)),
                 )
                 with torch.inference_mode(), _autocast_disabled(hift_parameter.device):
                     self.hift_graph_wrapper.capture()
