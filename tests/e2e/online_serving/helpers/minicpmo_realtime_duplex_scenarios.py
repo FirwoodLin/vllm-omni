@@ -432,7 +432,9 @@ class DemoState:
             response = event.get("response")
             metadata = response.get("metadata") if isinstance(response, dict) else None
             playback = metadata.get("playback") if isinstance(metadata, dict) else event.get("playback")
-            sent_ms = playback.get("sent_ms") if isinstance(playback, dict) else None
+            sent_ms = playback.get("send_enqueued_ms") if isinstance(playback, dict) else None
+            if not isinstance(sent_ms, int | float) and isinstance(playback, dict):
+                sent_ms = playback.get("sent_ms")
             if isinstance(sent_ms, int | float):
                 return max(0, int(sent_ms))
         return 0
@@ -515,7 +517,7 @@ def _session_update_event(args: argparse.Namespace) -> dict[str, object]:
         "overlap_short_ack_ms": args.short_ack_ms,
         "playback_commit_policy": "ack_only",
         "extra_body": {
-            "auto_response": True,
+            "auto_response": bool(getattr(args, "auto_response", True)),
             "minicpmo45_native_duplex": True,
             "force_listen_count": 0,
         },
@@ -1036,9 +1038,10 @@ async def _ack_response_playback(
         json.dumps(
             {
                 "type": "playback.ack",
-                "response_id": response_id,
-                "item_id": f"item_{response_id}",
+                **state.timing_events.playback_identity(response_id),
+                "observation_seq": 0,
                 "played_ms": played_ms,
+                "commit": True,
                 "committed_ms": played_ms,
             }
         )

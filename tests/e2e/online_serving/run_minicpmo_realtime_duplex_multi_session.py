@@ -7,10 +7,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import json
+import math
+import statistics
 import sys
+import time
 import uuid
+from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +26,7 @@ from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parents[3]
+REPO_ROOT = SCRIPT_DIR.parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -58,21 +63,24 @@ class _SynchronizedStartGate:
         self._timeout_s = timeout_s
         self._arrived = 0
         self._released = False
+        self._released_at_s: float | None = None
         self._failure: BaseException | None = None
         self._event = asyncio.Event()
         self._lock = asyncio.Lock()
 
-    async def wait(self) -> None:
+    async def wait(self) -> float:
         async with self._lock:
             if self._failure is not None:
                 raise RuntimeError(f"synchronized start aborted: {self._failure!r}") from self._failure
             if self._released:
-                return
+                assert self._released_at_s is not None
+                return self._released_at_s
             self._arrived += 1
             if self._arrived == self._parties:
                 self._released = True
+                self._released_at_s = asyncio.get_running_loop().time()
                 self._event.set()
-                return
+                return self._released_at_s
 
         try:
             await asyncio.wait_for(self._event.wait(), timeout=self._timeout_s)
@@ -83,11 +91,14 @@ class _SynchronizedStartGate:
             )
             await self.abort(failure)
             if self._released and self._failure is None:
-                return
+                assert self._released_at_s is not None
+                return self._released_at_s
             raise failure from exc
 
         if self._failure is not None:
             raise RuntimeError(f"synchronized start aborted: {self._failure!r}") from self._failure
+        assert self._released_at_s is not None
+        return self._released_at_s
 
     async def abort(self, failure: BaseException) -> None:
         async with self._lock:
@@ -100,10 +111,446 @@ class _SynchronizedStartGate:
 async def _run_demo_with_start_gate(args: SimpleNamespace):
     start_gate = getattr(args, "start_barrier", None)
     try:
+        connection_delay_s = float(getattr(args, "connection_delay_s", 0.0))
+        if connection_delay_s > 0:
+            await asyncio.sleep(connection_delay_s)
         return await run_demo(args)
     except BaseException as exc:
         if start_gate is not None:
             await start_gate.abort(exc)
+        raise
+
+
+def _open_loop_unit_pcm16(pcm16: bytes, *, duration_ms: int = 1000) -> bytes:
+    """Return one exact-duration, speech-bearing PCM16 benchmark unit."""
+    if not pcm16:
+        raise ValueError("open-loop input WAV has no audio")
+    unit_bytes = 16_000 * 2 * duration_ms // 1000
+    active = _scenario_module()._pcm16_active_slice(pcm16, duration_ms)
+    if len(active) >= unit_bytes:
+        return active[:unit_bytes]
+    repeats = math.ceil(unit_bytes / len(active))
+    return (active * repeats)[:unit_bytes]
+
+
+def _open_loop_numeric_summary(values: list[float]) -> dict[str, float | int | None]:
+    finite = sorted(float(value) for value in values if math.isfinite(float(value)))
+
+    def percentile(quantile: float) -> float | None:
+        if not finite:
+            return None
+        position = (len(finite) - 1) * quantile
+        lower = int(position)
+        upper = min(lower + 1, len(finite) - 1)
+        fraction = position - lower
+        return finite[lower] + fraction * (finite[upper] - finite[lower])
+
+    return {
+        "count": len(finite),
+        "min": min(finite) if finite else None,
+        "median": statistics.median(finite) if finite else None,
+        "p95": percentile(0.95),
+        "p99": percentile(0.99),
+        "max": max(finite) if finite else None,
+        "mean": statistics.fmean(finite) if finite else None,
+    }
+
+
+def _open_loop_schedule_summary(ticks: list[dict[str, object]]) -> dict[str, object]:
+    send_lag_ms = [float(value) for tick in ticks if isinstance((value := tick.get("send_lag_ms")), int | float)]
+    send_duration_ms = [
+        float(value) for tick in ticks if isinstance((value := tick.get("send_duration_ms")), int | float)
+    ]
+    return {
+        "scheduled_unit_count": len(ticks),
+        "send_lag_ms": _open_loop_numeric_summary(send_lag_ms),
+        "send_duration_ms": _open_loop_numeric_summary(send_duration_ms),
+        "end_send_lag_ms": send_lag_ms[-1] if send_lag_ms else None,
+    }
+
+
+def _open_loop_append_payload(
+    unit_pcm16: bytes,
+    *,
+    cumulative_audio_ms: int,
+    tick_index: int,
+    scheduled_ns: int,
+    frame_b64: str | None,
+    force_listen: bool | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "type": "input_audio_buffer.append",
+        "audio": base64.b64encode(unit_pcm16).decode("ascii"),
+        "input_audio_format": "pcm16",
+        "sample_rate_hz": 16_000,
+        "duration_ms": 1000,
+        "audio_end_ms": cumulative_audio_ms,
+        "benchmark_tick_index": tick_index,
+        "benchmark_scheduled_monotonic_ns": scheduled_ns,
+    }
+    if force_listen is not None:
+        payload["force_listen"] = bool(force_listen)
+    if frame_b64 is not None:
+        payload["video_frames"] = [frame_b64]
+    return payload
+
+
+def _fixed_duty_tick_is_speak(tick_index: int, unit_count: int, speak_duty: float) -> bool:
+    """Return a deterministic Bresenham-style speak/listen assignment.
+
+    ``speak_duty`` is intentionally required to produce an integral number of
+    speak units for the requested run.  This keeps the experiment label exact
+    rather than silently rounding a 25/50/100% target.
+    """
+    if unit_count <= 0:
+        raise ValueError("fixed-duty unit_count must be positive")
+    if not 0 <= speak_duty <= 1:
+        raise ValueError("fixed-duty speak_duty must be between 0 and 1")
+    if not 0 <= tick_index < unit_count:
+        raise ValueError("fixed-duty tick_index is outside the run")
+    duty = Fraction(str(speak_duty))
+    target_speak_units = duty * unit_count
+    if target_speak_units.denominator != 1:
+        raise ValueError(
+            f"fixed-duty speak_duty={speak_duty} does not yield an integral speak-unit count for {unit_count} units"
+        )
+    target = target_speak_units.numerator
+    # Use a ceiling accumulator so a non-zero duty starts with a speak unit;
+    # subsequent units are spread as evenly as the integer target allows.
+    return ((tick_index + 1) * target + unit_count - 1) // unit_count > (
+        tick_index * target + unit_count - 1
+    ) // unit_count
+
+
+async def _ack_completed_open_loop_playback(ws, state, stop: asyncio.Event, *, timeout_s: float) -> None:
+    while not stop.is_set():
+        await _scenario_module()._ack_all_completed_response_playback(
+            ws,
+            state,
+            timeout_s=timeout_s,
+        )
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=0.05)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _cancel_fixed_duty_responses(
+    ws,
+    state,
+    stop: asyncio.Event,
+    *,
+    cancel_after_audio_ms: int,
+) -> None:
+    """Close each fixed-duty response after its first generated audio chunk.
+
+    Native MiniCPM-o keeps a response/data-plane stream open across input
+    units.  The fixed-duty experiment needs an explicit response boundary so
+    later ticks do not become deferred input on the same response.  Cancelling
+    after the first audio delta preserves a generated speak chunk; forced-listen
+    responses are cancelled as soon as their listen event arrives.  Both paths
+    release the stream before the next tick when possible.
+    """
+    requested: set[str] = set()
+    first_audio_at: dict[str, float] = {}
+    delay_s = max(0, int(cancel_after_audio_ms)) / 1000.0
+
+    def response_epoch(response_id: str) -> int | None:
+        for event in state.events:
+            if event.get("type") != "response.created" or state._event_response_id(event) != response_id:
+                continue
+            response = event.get("response")
+            metadata = response.get("metadata") if isinstance(response, dict) else None
+            duplex_event = metadata.get("duplex_event") if isinstance(metadata, dict) else None
+            epoch = duplex_event.get("epoch") if isinstance(duplex_event, dict) else None
+            return epoch if isinstance(epoch, int) else None
+        return None
+
+    def response_has_listen(response_id: str) -> bool:
+        epoch = response_epoch(response_id)
+        if epoch is None:
+            return False
+        created_index = next(
+            (
+                index
+                for index, event in enumerate(state.events)
+                if event.get("type") == "response.created" and state._event_response_id(event) == response_id
+            ),
+            None,
+        )
+        if created_index is None:
+            return False
+        return any(
+            event.get("type") == "response.listen" and event.get("epoch") == epoch
+            for event in state.events[created_index + 1 :]
+        )
+
+    while not stop.is_set():
+        now = asyncio.get_running_loop().time()
+        for response_id in list(state.response_ids):
+            if response_id in requested or state.response_done(response_id):
+                continue
+            has_audio = state.response_audio_delta_count(response_id) > 0
+            has_listen = response_has_listen(response_id)
+            if not has_audio and not has_listen:
+                continue
+            if has_audio:
+                first_audio_at.setdefault(response_id, now)
+                if now - first_audio_at[response_id] < delay_s:
+                    continue
+            requested.add(response_id)
+            try:
+                await ws.send(json.dumps({"type": "response.cancel", "response_id": response_id}))
+                # A forced-listen commit retains its payload in the native
+                # committed buffer. Clear it after cancellation so the next
+                # speak unit cannot inherit force_listen=True.
+                if has_listen:
+                    await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+            except ConnectionClosed:
+                return
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=0.01)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _run_open_loop_session(
+    args: SimpleNamespace,
+    *,
+    start_barrier: _SynchronizedStartGate | None,
+) -> dict[str, object]:
+    scenario = _scenario_module()
+    source_pcm16 = scenario._read_wav_pcm16(Path(args.input_wav))
+    unit_pcm16 = _open_loop_unit_pcm16(source_pcm16)
+    frame_b64 = (
+        base64.b64encode(Path(args.frame_image).read_bytes()).decode("ascii") if args.frame_image is not None else None
+    )
+    session_id = args.session_id
+    url = _url_with_model(
+        args.url,
+        args.model,
+        autostart=False if args.ref_audio else None,
+        session_id=session_id,
+    )
+    state = scenario.DemoState()
+    reader_stop = asyncio.Event()
+    ack_stop = asyncio.Event()
+    fixed_duty_stop = asyncio.Event()
+    ticks: list[dict[str, object]] = []
+    reader = None
+    acker = None
+    fixed_duty_canceller = None
+    speak_duty = getattr(args, "open_loop_speak_duty", None)
+    cancel_after_audio_ms = int(getattr(args, "open_loop_cancel_after_audio_ms", 0))
+    if speak_duty is not None:
+        # Validate before opening the socket so a malformed experiment cannot
+        # leave a server session behind.
+        _fixed_duty_tick_is_speak(0, args.open_loop_units, float(speak_duty))
+
+    async with websockets.connect(url, max_size=64 * 1024 * 1024) as ws:
+        reader = asyncio.create_task(scenario._reader(ws, state, reader_stop))
+        try:
+            await ws.send(json.dumps(scenario._session_update_event(args)))
+            await scenario._wait_for(
+                state,
+                lambda: state.count("session.created") > 0,
+                timeout_s=min(float(args.timeout_s), 60.0),
+                label="open-loop session.created",
+            )
+            released_at_s = (
+                await start_barrier.wait() if start_barrier is not None else asyncio.get_running_loop().time()
+            )
+            first_tick_s = released_at_s + 0.25
+            if speak_duty is None:
+                acker = asyncio.create_task(
+                    _ack_completed_open_loop_playback(
+                        ws,
+                        state,
+                        ack_stop,
+                        timeout_s=min(float(args.timeout_s), 30.0),
+                    )
+                )
+            if speak_duty is not None:
+                fixed_duty_canceller = asyncio.create_task(
+                    _cancel_fixed_duty_responses(
+                        ws,
+                        state,
+                        fixed_duty_stop,
+                        cancel_after_audio_ms=cancel_after_audio_ms,
+                    )
+                )
+            cumulative_audio_ms = 0
+            for tick_index in range(args.open_loop_units):
+                scheduled_at_s = first_tick_s + tick_index * args.open_loop_period_ms / 1000.0
+                await asyncio.sleep(max(0.0, scheduled_at_s - asyncio.get_running_loop().time()))
+                send_started_ns = time.monotonic_ns()
+                scheduled_ns = int(scheduled_at_s * 1_000_000_000)
+                cumulative_audio_ms += 1000
+                tick_is_speak = (
+                    _fixed_duty_tick_is_speak(tick_index, args.open_loop_units, float(speak_duty))
+                    if speak_duty is not None
+                    else None
+                )
+                await ws.send(
+                    json.dumps(
+                        _open_loop_append_payload(
+                            unit_pcm16,
+                            cumulative_audio_ms=cumulative_audio_ms,
+                            tick_index=tick_index,
+                            scheduled_ns=scheduled_ns,
+                            frame_b64=frame_b64,
+                            force_listen=(not tick_is_speak) if tick_is_speak is not None else None,
+                        )
+                    )
+                )
+                if speak_duty is not None:
+                    # Turn-mode native input buffers require an explicit
+                    # response_create decision for every unit.  force_listen
+                    # makes the listen half consume the unit without speech
+                    # generation; the speak half follows the same response
+                    # path and is bounded by the canceller above.
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "input_audio_buffer.commit",
+                                "final": True,
+                                "response_create": True,
+                            }
+                        )
+                    )
+                send_completed_ns = time.monotonic_ns()
+                ticks.append(
+                    {
+                        "tick_index": tick_index,
+                        "scheduled_monotonic_ns": scheduled_ns,
+                        "send_started_monotonic_ns": send_started_ns,
+                        "send_completed_monotonic_ns": send_completed_ns,
+                        "send_lag_ms": (send_started_ns - scheduled_ns) / 1_000_000.0,
+                        "send_duration_ms": (send_completed_ns - send_started_ns) / 1_000_000.0,
+                        "audio_end_ms": cumulative_audio_ms,
+                        **({"speak": tick_is_speak} if tick_is_speak is not None else {}),
+                    }
+                )
+
+            await asyncio.sleep(max(0.0, float(args.open_loop_drain_s)))
+            ack_stop.set()
+            if acker is not None:
+                await acker
+            if speak_duty is None:
+                await scenario._ack_all_completed_response_playback(
+                    ws,
+                    state,
+                    timeout_s=min(float(args.timeout_s), 30.0),
+                )
+            await ws.send(json.dumps({"type": "session.close"}))
+            await scenario._wait_for(
+                state,
+                lambda: state.count("session.closed") > 0,
+                timeout_s=min(float(args.timeout_s), 30.0),
+                label="open-loop session.closed",
+            )
+        finally:
+            ack_stop.set()
+            fixed_duty_stop.set()
+            if acker is not None and not acker.done():
+                acker.cancel()
+                try:
+                    await acker
+                except asyncio.CancelledError:
+                    pass
+            if fixed_duty_canceller is not None and not fixed_duty_canceller.done():
+                fixed_duty_canceller.cancel()
+                try:
+                    await fixed_duty_canceller
+                except asyncio.CancelledError:
+                    pass
+            if state.count("session.created") > 0 and state.count("session.closed") == 0:
+                try:
+                    await ws.send(json.dumps({"type": "session.close"}))
+                except ConnectionClosed:
+                    pass
+            reader_stop.set()
+            if reader is not None:
+                reader.cancel()
+                try:
+                    await reader
+                except asyncio.CancelledError:
+                    pass
+
+    output_dir = Path(args.output_dir)
+    scenario._write_demo_artifacts(state, output_dir, output_audio_format=args.output_audio_format)
+    timed_events = state.timing_events.events
+    (output_dir / "events.jsonl").write_text(
+        "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in timed_events),
+        encoding="utf-8",
+    )
+    (output_dir / "input_schedule.json").write_text(
+        json.dumps(ticks, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    response_timings = state.response_timing_summaries()
+    request_metrics = state.session_request_metrics(session_id=session_id)
+    completed_response_ids = [response_id for response_id in state.response_ids if state.response_done(response_id)]
+    errors = scenario._unexpected_error_events(state)
+    audio_delta_count = state.count("response.audio.delta")
+    require_audio_ok = not args.open_loop_require_audio or audio_delta_count > 0
+    audio_response_count = sum(
+        1 for response_id in state.response_ids if state.response_audio_delta_count(response_id) > 0
+    )
+    expected_speak_unit_count = (
+        sum(1 for tick in ticks if tick.get("speak") is True) if speak_duty is not None else None
+    )
+    fixed_duty_exact_ok = speak_duty is None or audio_response_count == expected_speak_unit_count
+    return {
+        "ok": bool(
+            len(ticks) == args.open_loop_units
+            and state.count("session.created") == 1
+            and state.count("session.closed") == 1
+            and not errors
+            and require_audio_ok
+            and fixed_duty_exact_ok
+        ),
+        "session_id": session_id,
+        "completed_response_ids": completed_response_ids,
+        "response_timings": response_timings,
+        "request_metrics": request_metrics,
+        "open_loop": {
+            **_open_loop_schedule_summary(ticks),
+            "period_ms": args.open_loop_period_ms,
+            "drain_s": args.open_loop_drain_s,
+            "response_created_count": state.count("response.created"),
+            "response_done_count": state.count("response.done"),
+            "response_listen_count": state.count("response.listen"),
+            "audio_delta_count": audio_delta_count,
+            "audio_response_count": audio_response_count,
+            "require_audio_ok": require_audio_ok,
+            "fixed_speak_duty": float(speak_duty) if speak_duty is not None else None,
+            "fixed_speak_unit_count": (
+                sum(1 for tick in ticks if tick.get("speak") is True) if speak_duty is not None else None
+            ),
+            "fixed_listen_unit_count": (
+                sum(1 for tick in ticks if tick.get("speak") is False) if speak_duty is not None else None
+            ),
+            "fixed_audio_response_count": audio_response_count if speak_duty is not None else None,
+            "fixed_duty_exact_ok": fixed_duty_exact_ok if speak_duty is not None else None,
+            "fixed_response_cancel_after_audio_ms": (cancel_after_audio_ms if speak_duty is not None else None),
+            "fixed_response_cancelled_count": state.cancelled_count if speak_duty is not None else None,
+        },
+        "error_count": len(errors),
+        "errors": errors,
+        "output_dir": str(output_dir),
+    }
+
+
+async def _run_open_loop_with_start_gate(args: SimpleNamespace, start_barrier: _SynchronizedStartGate | None):
+    try:
+        connection_delay_s = float(getattr(args, "connection_delay_s", 0.0))
+        if connection_delay_s > 0:
+            await asyncio.sleep(connection_delay_s)
+        return await _run_open_loop_session(args, start_barrier=start_barrier)
+    except BaseException as exc:
+        if start_barrier is not None:
+            await start_barrier.abort(exc)
         raise
 
 
@@ -533,6 +980,7 @@ def _demo_args(
         session_id=f"multi-{index}-{uuid.uuid4().hex}",
         input_wav=input_wav,
         ref_audio=args.ref_audio,
+        frame_image=args.frame_image,
         turn_input_wav=list(args.turn_input_wav),
         output_dir=str(Path(args.output_dir) / f"session_{index:02d}"),
         output_audio_format="pcm16",
@@ -554,6 +1002,14 @@ def _demo_args(
         timeout_s=args.timeout_s,
         model_policy_settle_ms=args.model_policy_settle_ms,
         start_barrier=start_barrier,
+        connection_delay_s=args.connection_stagger_ms * index / 1000.0,
+        open_loop_units=args.open_loop_units,
+        open_loop_period_ms=args.open_loop_period_ms,
+        open_loop_drain_s=args.open_loop_drain_s,
+        open_loop_require_audio=args.open_loop_require_audio,
+        open_loop_speak_duty=args.open_loop_speak_duty,
+        open_loop_cancel_after_audio_ms=args.open_loop_cancel_after_audio_ms,
+        auto_response=args.open_loop_speak_duty is None,
     )
 
 
@@ -588,10 +1044,22 @@ async def run_multi_session(args: argparse.Namespace) -> dict[str, object]:
         if getattr(args, "synchronized_start", False)
         else None
     )
-    session_results = await asyncio.gather(
-        *(_run_demo_with_start_gate(_demo_args(args, index, start_barrier)) for index in range(args.sessions)),
-        return_exceptions=True,
-    )
+    if args.open_loop_units > 0:
+        session_results = await asyncio.gather(
+            *(
+                _run_open_loop_with_start_gate(
+                    _demo_args(args, index, start_barrier),
+                    start_barrier,
+                )
+                for index in range(args.sessions)
+            ),
+            return_exceptions=True,
+        )
+    else:
+        session_results = await asyncio.gather(
+            *(_run_demo_with_start_gate(_demo_args(args, index, start_barrier)) for index in range(args.sessions)),
+            return_exceptions=True,
+        )
     failures = [repr(result) for result in session_results if isinstance(result, BaseException)]
     completed = [result for result in session_results if isinstance(result, dict)]
     identity_isolation_ok = _validate_identity_isolation(completed)
@@ -612,6 +1080,11 @@ async def run_multi_session(args: argparse.Namespace) -> dict[str, object]:
             and lifecycle_result["ok"] is True
         ),
         "session_count": args.sessions,
+        "workload_mode": "open_loop" if args.open_loop_units > 0 else "closed_loop",
+        "open_loop_units": args.open_loop_units if args.open_loop_units > 0 else None,
+        "open_loop_period_ms": args.open_loop_period_ms if args.open_loop_units > 0 else None,
+        "open_loop_speak_duty": (args.open_loop_speak_duty if args.open_loop_units > 0 else None),
+        "open_loop_cancel_after_audio_ms": (args.open_loop_cancel_after_audio_ms if args.open_loop_units > 0 else None),
         "identity_isolation_ok": identity_isolation_ok,
         "semantic_isolation_ok": semantic_isolation_ok,
         "resume": resume_result,
@@ -664,6 +1137,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sessions", type=int, default=2)
     parser.add_argument("--input-wav", required=True)
     parser.add_argument("--ref-audio", help="Optional WAV used as the MiniCPM-o voice prompt for every session.")
+    parser.add_argument(
+        "--frame-image",
+        default=None,
+        help="Optional image sent as one camera frame per native 1 s audio unit.",
+    )
     parser.add_argument("--session-input-wav", action="append", default=[])
     parser.add_argument("--session-expected-token", action="append", default=[])
     parser.add_argument("--turn-input-wav", action="append", default=[])
@@ -671,6 +1149,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--realtime-input", action="store_true")
     parser.add_argument("--chunk-ms", type=int, default=200)
     parser.add_argument("--turns", type=int, default=1)
+    parser.add_argument(
+        "--open-loop-units",
+        type=int,
+        default=0,
+        help="Send this many native 1 s input units on an absolute clock without waiting for responses.",
+    )
+    parser.add_argument("--open-loop-period-ms", type=int, default=1000)
+    parser.add_argument("--open-loop-drain-s", type=float, default=5.0)
+    parser.add_argument(
+        "--open-loop-speak-duty",
+        type=float,
+        default=None,
+        help=(
+            "Experimental exact speak-unit duty in [0,1]. Each speak response is "
+            "closed after its first audio chunk; requires an integral target count."
+        ),
+    )
+    parser.add_argument(
+        "--open-loop-cancel-after-audio-ms",
+        type=int,
+        default=0,
+        help="Delay before cancelling each fixed-duty response after its first audio delta.",
+    )
+    parser.add_argument(
+        "--open-loop-require-audio",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require every open-loop session to exercise the speech-output path (off for listen-only load).",
+    )
     parser.add_argument("--first-turn-ms", type=int, default=1400)
     parser.add_argument("--turn-duration-ms", type=int, action="append", default=[])
     parser.add_argument("--expect-empty-turn", type=int, action="append", default=[])
@@ -693,17 +1200,45 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Wait until every session is created before starting input.",
     )
+    parser.add_argument(
+        "--connection-stagger-ms",
+        type=float,
+        default=0.0,
+        help="Delay connection i by i times this interval while preserving synchronized input start.",
+    )
     parser.add_argument("--model-policy-settle-ms", type=int, default=600)
     parser.add_argument("--timeout-s", type=float, default=120.0)
     args = parser.parse_args()
     if args.base_url:
         args.url = args.base_url.rstrip("/") + "/v1/realtime?duplex=1"
+    if args.frame_image is not None and not Path(args.frame_image).is_file():
+        parser.error(f"--frame-image does not exist: {args.frame_image}")
     if args.session_input_wav and len(args.session_input_wav) != args.sessions:
         parser.error("provide exactly one --session-input-wav per session")
     if args.session_expected_token and len(args.session_expected_token) != args.sessions:
         parser.error("provide exactly one --session-expected-token per session")
     if args.session_expected_token and not args.session_input_wav:
         parser.error("--session-expected-token requires --session-input-wav")
+    if args.open_loop_units < 0:
+        parser.error("--open-loop-units must be non-negative")
+    if args.open_loop_period_ms <= 0:
+        parser.error("--open-loop-period-ms must be positive")
+    if args.open_loop_drain_s < 0:
+        parser.error("--open-loop-drain-s must be non-negative")
+    if args.open_loop_speak_duty is not None:
+        if not 0 <= args.open_loop_speak_duty <= 1:
+            parser.error("--open-loop-speak-duty must be between 0 and 1")
+        if args.open_loop_units <= 0:
+            parser.error("--open-loop-speak-duty requires --open-loop-units")
+        target = Fraction(str(args.open_loop_speak_duty)) * args.open_loop_units
+        if target.denominator != 1:
+            parser.error("--open-loop-speak-duty must yield an integral speak-unit count")
+    if args.open_loop_cancel_after_audio_ms < 0:
+        parser.error("--open-loop-cancel-after-audio-ms must be non-negative")
+    if args.connection_stagger_ms < 0:
+        parser.error("--connection-stagger-ms must be non-negative")
+    if args.open_loop_units > 0 and args.turn_input_wav:
+        parser.error("--turn-input-wav is not used by the open-loop workload")
     normalized_expected_tokens = [token.strip().casefold() for token in args.session_expected_token]
     for token_index, token in enumerate(normalized_expected_tokens):
         if any(

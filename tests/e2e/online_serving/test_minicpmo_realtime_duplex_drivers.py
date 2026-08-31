@@ -819,6 +819,37 @@ def test_realtime_duplex_synchronized_start_gate_releases_all_participants():
     assert set(asyncio.run(exercise())) == {0, 1, 2}
 
 
+def test_realtime_duplex_synchronized_start_gate_returns_one_shared_clock_origin():
+    demo = _load_multi_demo_module()
+
+    async def exercise():
+        gate = demo._SynchronizedStartGate(3, timeout_s=0.5)
+        return await asyncio.gather(*(gate.wait() for _ in range(3)))
+
+    released_at = asyncio.run(exercise())
+    assert len(set(released_at)) == 1
+    assert released_at[0] > 0
+
+
+def test_realtime_duplex_open_loop_builds_exact_native_units_and_summarizes_schedule():
+    demo = _load_multi_demo_module()
+    source = b"\x01\x00\x02\x00"
+
+    unit = demo._open_loop_unit_pcm16(source)
+    summary = demo._open_loop_schedule_summary(
+        [
+            {"send_lag_ms": 1.0, "send_duration_ms": 2.0},
+            {"send_lag_ms": 3.0, "send_duration_ms": 4.0},
+        ]
+    )
+
+    assert len(unit) == 16_000 * 2
+    assert unit[:8] == source * 2
+    assert summary["scheduled_unit_count"] == 2
+    assert summary["send_lag_ms"]["median"] == 2.0
+    assert summary["end_send_lag_ms"] == 3.0
+
+
 def test_realtime_duplex_synchronized_start_gate_aborts_waiters_on_failure(monkeypatch):
     demo = _load_multi_demo_module()
 
@@ -917,6 +948,22 @@ def test_realtime_duplex_demo_session_update_uses_explicit_session_id():
     assert event["session"]["extra_body"]["minicpmo45_native_duplex"] is True
 
 
+def test_realtime_duplex_demo_session_update_respects_auto_response_override():
+    demo = _load_demo_module()
+
+    event = demo._session_update_event(
+        SimpleNamespace(
+            model="openbmb/MiniCPM-o-4_5",
+            output_audio_format="pcm16",
+            short_ack_ms=1200,
+            session_id=None,
+            auto_response=False,
+        )
+    )
+
+    assert event["session"]["extra_body"]["auto_response"] is False
+
+
 def test_realtime_duplex_demo_response_required_uses_deterministic_sampling():
     demo = _load_demo_module()
 
@@ -980,7 +1027,7 @@ def test_realtime_duplex_demo_reads_response_playback_cursor():
                 "id": "resp-1",
                 "metadata": {
                     "playback": {
-                        "sent_ms": 27920,
+                        "send_enqueued_ms": 27920,
                         "played_ms": 0,
                     }
                 },
@@ -1622,7 +1669,7 @@ def test_realtime_duplex_demo_playback_gate_covers_unassigned_completed_response
                 "type": "response.done",
                 "response": {
                     "id": response_id,
-                    "metadata": {"playback": {"sent_ms": 1200}},
+                    "metadata": {"playback": {"send_enqueued_ms": 1200}},
                 },
             }
         )
@@ -1645,14 +1692,29 @@ def test_realtime_duplex_demo_playback_gate_covers_unassigned_completed_response
 def test_realtime_duplex_demo_acks_unassigned_completed_response():
     demo = _load_demo_module()
     state = demo.DemoState()
+    state.add({"type": "session.created", "incarnation": 0, "session": {"id": "sid-test", "epoch": 0}})
     for response_id in ("resp-assigned", "resp-unassigned"):
-        state.add({"type": "response.created", "response": {"id": response_id}})
+        state.add(
+            {
+                "type": "response.created",
+                "response": {
+                    "id": response_id,
+                    "metadata": {
+                        "duplex_event": {
+                            "session_id": "sid-test",
+                            "incarnation": 0,
+                            "epoch": 0,
+                        }
+                    },
+                },
+            }
+        )
         state.add(
             {
                 "type": "response.done",
                 "response": {
                     "id": response_id,
-                    "metadata": {"playback": {"sent_ms": 1200}},
+                    "metadata": {"playback": {"send_enqueued_ms": 1200}},
                 },
             }
         )
@@ -1880,12 +1942,28 @@ def test_realtime_duplex_demo_playback_ack_identifies_and_commits_response():
     demo = _load_demo_module()
     state = demo.DemoState()
     response_id = "resp-overlap-second"
+    state.add({"type": "session.created", "incarnation": 2, "session": {"id": "sid-overlap", "epoch": 7}})
+    state.add(
+        {
+            "type": "response.created",
+            "response": {
+                "id": response_id,
+                "metadata": {
+                    "duplex_event": {
+                        "session_id": "sid-overlap",
+                        "incarnation": 2,
+                        "epoch": 7,
+                    }
+                },
+            },
+        }
+    )
     state.add(
         {
             "type": "response.done",
             "response": {
                 "id": response_id,
-                "metadata": {"playback": {"sent_ms": 1200}},
+                "metadata": {"playback": {"send_enqueued_ms": 1200}},
             },
         }
     )
@@ -1921,9 +1999,14 @@ def test_realtime_duplex_demo_playback_ack_identifies_and_commits_response():
     assert ws.messages == [
         {
             "type": "playback.ack",
+            "session_id": "sid-overlap",
+            "incarnation": 2,
+            "epoch": 7,
             "response_id": response_id,
             "item_id": f"item_{response_id}",
+            "observation_seq": 0,
             "played_ms": 1200,
+            "commit": True,
             "committed_ms": 1200,
         }
     ]
