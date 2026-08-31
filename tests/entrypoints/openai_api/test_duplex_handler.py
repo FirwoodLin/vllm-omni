@@ -106,6 +106,7 @@ class FakeEngineClient:
         self.opened: list[str] = []
         self.opened_fences: list[DuplexFence | None] = []
         self.appended: list[tuple[str, str, object, bool]] = []
+        self.append_started_at: list[float] = []
         self.append_operation_ids: list[str | None] = []
         self.appended_fences: list[DuplexFence | None] = []
         self.opened_configs: list[dict[str, object]] = []
@@ -159,6 +160,7 @@ class FakeEngineClient:
         fence: DuplexFence | None = None,
     ) -> None:
         del timeout, collect_outputs
+        self.append_started_at.append(asyncio.get_running_loop().time())
         self.appended.append((session_id, mode, payload, final))
         self.append_operation_ids.append(operation_id)
         self.appended_fences.append(fence)
@@ -1133,6 +1135,7 @@ def test_native_realtime_protocol_updates_in_progress_item_for_audio_truncate():
 
     assert translated is None
     assert protocol._conversation_items["item_resp-truncate"]["content"][0]["transcript"] == "he"
+    assert protocol._pending_outbound.qsize() == 1
 
 
 @pytest.mark.asyncio
@@ -1443,6 +1446,46 @@ def test_minicpmo_pcm_append_buffer_drops_serving_new_user_turn_marker():
     assert "new_user_turn" not in emitted
     assert "new_user_turn_prefix_variant" not in emitted
     assert "force_speak" not in emitted
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_buffered_turn_forwards_benchmark_timing_metadata():
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    ws = TimedWebSocket()
+    ws.put(_native_session_create("sid-benchmark-timing"))
+    ws.put(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(16_000),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16_000,
+            "benchmark_tick_index": 7,
+            "benchmark_scheduled_monotonic_ns": 123_000_000,
+            "audio_end_ms": 8_000,
+        }
+    )
+    ws.put(
+        {
+            "type": "input_audio_buffer.commit",
+            "final": True,
+            "response_create": True,
+        }
+    )
+    ws.put({"type": "session.close"})
+
+    await handler.handle_session(ws)
+
+    assert len(engine.appended) == 1
+    payload = engine.appended[0][2]
+    assert isinstance(payload, dict)
+    assert payload["benchmark_tick_index"] == 7
+    assert payload["benchmark_scheduled_monotonic_ns"] == 123_000_000
+    assert payload["audio_end_ms"] == 8_000
 
 
 def test_minicpmo_merge_native_audio_payloads_preserves_speech_marker():
@@ -3774,14 +3817,27 @@ async def test_duplex_handler_preserves_typed_admission_error():
 
 
 @pytest.mark.asyncio
-async def test_duplex_cancel_reports_playback_committed_cursor():
+async def test_duplex_cancel_rejects_over_ack_and_reports_zero_committed_cursor():
     engine = FakeEngineClient()
     chat_service = FakeChatService(engine)
     handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
 
     def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
         if data.get("type") == "response.created":
-            ws.put({"type": "playback.ack", "played_ms": 1200, "committed_ms": 1000})
+            ws.put(
+                {
+                    "type": "playback.ack",
+                    "session_id": data["session_id"],
+                    "incarnation": data["incarnation"],
+                    "epoch": data["epoch"],
+                    "response_id": data["response_id"],
+                    "item_id": data["item_id"],
+                    "observation_seq": 0,
+                    "played_ms": 1200,
+                    "commit": True,
+                    "committed_ms": 1000,
+                }
+            )
             ws.put({"type": "input.cancel", "reason": "test_barge_in"})
 
     ws = TimedWebSocket(on_send=on_send)
@@ -3791,11 +3847,10 @@ async def test_duplex_cancel_reports_playback_committed_cursor():
 
     await handler.handle_session(ws)
 
-    ack = next(m for m in ws.sent if m.get("type") == "playback.acknowledged")
+    error = next(m for m in ws.sent if m.get("type") == "error")
     cancelled = next(m for m in ws.sent if m.get("type") == "audio.cancelled")
-    assert ack["playback"]["played_ms"] == 1200
-    assert ack["playback"]["committed_ms"] == 1000
-    assert cancelled["committed_ms"] == 1000
+    assert error["code"] == "playback_cursor_out_of_bounds"
+    assert cancelled["committed_ms"] == 0
     assert cancelled["epoch"] == 1
 
 
@@ -3810,24 +3865,32 @@ async def test_playback_ack_response_id_selects_matching_pending_history_item():
         session_id="sid-playback-response-id",
         config=DuplexSessionConfig(),
     )
-    first_item_id = "item_resp-first"
-    second_item_id = "item_resp-second"
-    session.stage_pending_history_item(
-        first_item_id,
-        {"role": "assistant", "content": "first response"},
-    )
-    session.stage_pending_history_item(
-        second_item_id,
-        {"role": "assistant", "content": "second response"},
-    )
+    first_response_id = session.begin_response()
+    first_item_id = f"item_{first_response_id}"
+    session.append_assistant_text("first response")
+    session.mark_audio_sent(1000)
+    session.end_response(commit_text=False, preserve_request=True)
+    session.register_history_item(first_item_id, None)
+    second_response_id = session.begin_response()
+    second_item_id = f"item_{second_response_id}"
+    session.append_assistant_text("second response")
+    session.mark_audio_sent(1000)
+    session.end_response(commit_text=False, preserve_request=True)
+    session.register_history_item(second_item_id, None)
     ws = TimedWebSocket()
 
     await handler._handle_playback_ack(
         session,
         {
             "type": "playback.ack",
-            "response_id": "resp-second",
+            "session_id": session.session_id,
+            "incarnation": session.incarnation,
+            "epoch": session.epoch,
+            "response_id": second_response_id,
+            "item_id": second_item_id,
+            "observation_seq": 0,
             "played_ms": 1000,
+            "commit": True,
             "committed_ms": 1000,
         },
         ws.send_json,
@@ -3865,9 +3928,14 @@ async def test_late_playback_ack_does_not_advance_new_response_cursor():
         session,
         {
             "type": "playback.ack",
+            "session_id": session.session_id,
+            "incarnation": session.incarnation,
+            "epoch": session.epoch,
             "response_id": first_response_id,
             "item_id": f"item_{first_response_id}",
+            "observation_seq": 0,
             "played_ms": 11480,
+            "commit": True,
             "committed_ms": 11480,
         },
         ws.send_json,
@@ -3876,18 +3944,18 @@ async def test_late_playback_ack_does_not_advance_new_response_cursor():
     assert session.active_response_id == second_response_id
     assert session.playback.as_dict() == {
         "generated_ms": 2200,
-        "sent_ms": 2200,
+        "send_enqueued_ms": 2200,
         "played_ms": 0,
         "committed_ms": 0,
     }
     ack = next(message for message in ws.sent if message.get("type") == "playback.acknowledged")
     assert ack["playback"] == {
         "generated_ms": 11480,
-        "sent_ms": 11480,
+        "send_enqueued_ms": 11480,
         "played_ms": 11480,
         "committed_ms": 11480,
     }
-    assert first_response_id not in session.response_playbacks
+    assert first_response_id in session.response_playbacks
     assert session.response_playbacks[second_response_id] == session.playback
 
 
@@ -3916,9 +3984,14 @@ async def test_late_playback_ack_truncates_history_with_matching_response_cursor
         session,
         {
             "type": "playback.ack",
+            "session_id": session.session_id,
+            "incarnation": session.incarnation,
+            "epoch": session.epoch,
             "response_id": first_response_id,
             "item_id": f"item_{first_response_id}",
+            "observation_seq": 0,
             "played_ms": 500,
+            "commit": True,
             "committed_ms": 500,
         },
         ws.send_json,
@@ -3926,6 +3999,104 @@ async def test_late_playback_ack_truncates_history_with_matching_response_cursor
 
     assert session.history[-1] == {"role": "assistant", "content": "abcde"}
     assert first_response_id in session.response_playbacks
+
+
+@pytest.mark.asyncio
+async def test_playback_ack_rejects_bad_fences_and_keeps_observation_separate_from_history_commit():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-strict-playback-ack",
+        config=DuplexSessionConfig(),
+        incarnation=4,
+    )
+    response_id = session.begin_response()
+    item_id = f"item_{response_id}"
+    session.append_assistant_text("abcdefghij")
+    session.mark_audio_sent(1000, text_chars=10)
+    session.end_response(commit_text=False)
+    session.register_history_item(item_id, None)
+    ws = TimedWebSocket()
+    base = {
+        "type": "playback.ack",
+        "session_id": session.session_id,
+        "incarnation": session.incarnation,
+        "epoch": session.epoch,
+        "response_id": response_id,
+        "item_id": item_id,
+        "observation_seq": 0,
+        "played_ms": 500,
+    }
+
+    missing = dict(base)
+    missing.pop("session_id")
+    await handler._handle_playback_ack(session, missing, ws.send_json)
+    assert ws.sent[-1]["code"] == "missing_playback_identity"
+
+    await handler._handle_playback_ack(
+        session,
+        {**base, "response_id": "resp-unknown", "item_id": "item_resp-unknown"},
+        ws.send_json,
+    )
+    assert ws.sent[-1]["code"] == "unknown_playback_response"
+
+    await handler._handle_playback_ack(session, {**base, "item_id": "item_conflict"}, ws.send_json)
+    assert ws.sent[-1]["code"] == "playback_item_conflict"
+
+    await handler._handle_playback_ack(session, {**base, "played_ms": 1001}, ws.send_json)
+    assert ws.sent[-1]["code"] == "playback_cursor_out_of_bounds"
+
+    await handler._handle_playback_ack(session, {**base, "committed_ms": 500}, ws.send_json)
+    assert ws.sent[-1]["code"] == "playback_commit_not_explicit"
+
+    await handler._handle_playback_ack(session, base, ws.send_json)
+    assert ws.sent[-1]["type"] == "playback.acknowledged"
+    assert ws.sent[-1]["history_committed"] is False
+    assert session.history == ()
+
+    await handler._handle_playback_ack(
+        session,
+        {**base, "played_ms": 600},
+        ws.send_json,
+    )
+    assert ws.sent[-1]["code"] == "out_of_order_playback_ack"
+
+    await handler._handle_playback_ack(
+        session,
+        {**base, "observation_seq": 1, "played_ms": 400},
+        ws.send_json,
+    )
+    assert ws.sent[-1]["code"] == "playback_cursor_regression"
+
+    commit = {
+        **base,
+        "observation_seq": 1,
+        "commit": True,
+        "committed_ms": 500,
+    }
+    await handler._handle_playback_ack(session, commit, ws.send_json)
+    assert ws.sent[-1]["type"] == "playback.acknowledged"
+    assert ws.sent[-1]["history_committed"] is True
+    assert session.history == ({"role": "assistant", "content": "abcde"},)
+
+    await handler._handle_playback_ack(
+        session,
+        {**commit, "observation_seq": 2},
+        ws.send_json,
+    )
+    assert ws.sent[-1]["type"] == "playback.acknowledged"
+    assert session.history == ({"role": "assistant", "content": "abcde"},)
+
+    session.barge_in()
+    await handler._handle_playback_ack(
+        session,
+        {**commit, "observation_seq": 3},
+        ws.send_json,
+    )
+    assert ws.sent[-1]["code"] == "stale_playback_epoch"
 
 
 @pytest.mark.asyncio
@@ -6254,7 +6425,7 @@ async def test_minicpmo_native_auto_response_keeps_request_bound_for_segment_con
     engine = FakeEngineClient(
         control_result=control_result,
         collect_outputs=[[terminal_segment], [], []],
-        collect_delay_s=0.05,
+        collect_delay_s=0.1,
     )
     handler = OmniDuplexSessionHandler(
         chat_service=FakeChatService(engine),
@@ -6267,7 +6438,7 @@ async def test_minicpmo_native_auto_response_keeps_request_bound_for_segment_con
             return
         session = handler._registry.get("sid-native-auto-continuation")
         assert session is not None
-        session.capabilities.chunk_period_ms = 50
+        session.capabilities.chunk_period_ms = 200
         ws.put(
             {
                 "type": "input_audio_buffer.append",
@@ -6290,6 +6461,19 @@ async def test_minicpmo_native_auto_response_keeps_request_bound_for_segment_con
     assert mode == "append_audio_chunk"
     assert payload["duplex_turn_id"] == 0
     assert final is False
+    first_silence_index = next(
+        index
+        for index, (_, _, appended_payload, _) in enumerate(engine.appended)
+        if isinstance(appended_payload, dict)
+        and appended_payload.get("audio") == OmniDuplexSessionHandler._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO
+    )
+    assert first_silence_index > 0
+    first_continuation_gap_s = (
+        engine.append_started_at[first_silence_index] - engine.append_started_at[first_silence_index - 1]
+    )
+    # The 100 ms fake inference delay consumes half of the 200 ms input
+    # period. A full post-inference sleep would make this roughly 300 ms.
+    assert 0.15 <= first_continuation_gap_s < 0.27
 
 
 @pytest.mark.asyncio
@@ -6852,6 +7036,50 @@ async def test_continuous_response_metrics_accumulate_only_owned_model_units():
     assert third_metrics["num_tokens_out"] == 3
     assert third_metrics["vllm_ttft_ms"] == 90.0
     assert third_metrics["vllm_itls_ms"] == [15.0, 16.0]
+
+
+@pytest.mark.asyncio
+async def test_native_audio_marks_generated_before_websocket_send_enqueued():
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(session_id="sid-send-enqueue", config=DuplexSessionConfig())
+    session.bind_request("duplex-sid-send-enqueue-e0-stage0")
+    cursor_during_enqueue: list[dict[str, int]] = []
+
+    async def send_json(payload: dict[str, Any]) -> None:
+        if payload.get("type") == "response.output_audio.delta":
+            cursor_during_enqueue.append(session.playback.as_dict())
+
+    await handler._send_one_native_duplex_event(
+        send_json,
+        {
+            "supported": True,
+            "stage_role": "tts",
+            "is_listen": False,
+            "data_plane_request_id": "duplex-sid-send-enqueue-e0-stage0",
+            "text": "hello",
+            "audio_data": "audio",
+            "audio_format": "pcm16",
+            "audio_duration_ms": 100,
+            "end_of_turn": False,
+            "model_turn_id": 0,
+        },
+        session=session,
+    )
+
+    assert cursor_during_enqueue == [
+        {
+            "generated_ms": 100,
+            "send_enqueued_ms": 0,
+            "played_ms": 0,
+            "committed_ms": 0,
+        }
+    ]
+    assert session.playback.as_dict() == {
+        "generated_ms": 100,
+        "send_enqueued_ms": 100,
+        "played_ms": 0,
+        "committed_ms": 0,
+    }
 
 
 @pytest.mark.asyncio

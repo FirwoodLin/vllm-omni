@@ -85,7 +85,11 @@ def test_client_has_transactional_cleanup_and_visible_event_logging():
 def test_client_keeps_microphone_upload_active_during_assistant_playback():
     source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
     upload_gate = re.search(r"function microphoneUploadEnabled\(\) \{(?P<body>.*?)\n  \}", source, re.DOTALL)
-    begin_assistant = re.search(r"function beginAssistant\(responseId\) \{(?P<body>.*?)\n  \}", source, re.DOTALL)
+    begin_assistant = re.search(
+        r"function beginAssistant\(responseId, event\) \{(?P<body>.*?)\n  \}",
+        source,
+        re.DOTALL,
+    )
 
     assert upload_gate is not None
     assert "return running && !muted;" in upload_gate.group("body")
@@ -129,6 +133,20 @@ def test_playback_worklet_buffers_first_400ms_and_reports_underruns():
     assert "playback-underrun" in playback
     assert "underrunFrames" in playback
     assert "underrunMs" in playback
+
+
+def test_playback_worklet_reports_80ms_progress_and_response_scoped_revoke():
+    app = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    playback = (STATIC_ROOT / "playback_worklet.js").read_text(encoding="utf-8")
+
+    assert "sampleRate * 0.08" in playback
+    assert "type: 'playback-progress'" in playback
+    assert "type: 'playback-revoked'" in playback
+    assert "entry.responseId !== responseId" in playback
+    assert "type: 'revoke', responseId" in app
+    assert "observation_seq" in app
+    assert "commit ? { committed_ms: playedMs }" in app
+    assert "revokedResponseIds.has(responseId)" in app
 
 
 def test_playback_worklet_waits_before_playing_and_rebuffers_after_underrun():
@@ -264,6 +282,62 @@ def test_playback_worklet_fades_terminal_drain_to_zero():
           messages.filter((message) => message.type === 'playback-drained').length === 1,
           'terminal drain must be reported exactly once after playback',
         );
+        """
+    )
+    subprocess.run(
+        [node, "-e", script, str(STATIC_ROOT / "playback_worklet.js")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_playback_worklet_progress_and_revoke_are_response_scoped():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the AudioWorklet regression test")
+
+    script = textwrap.dedent(
+        """
+        const fs = require('fs');
+        const vm = require('vm');
+
+        global.sampleRate = 1000;
+        const messages = [];
+        global.AudioWorkletProcessor = class {
+          constructor() {
+            this.port = {
+              onmessage: null,
+              postMessage: (message) => messages.push(message),
+            };
+          }
+        };
+        let Processor = null;
+        global.registerProcessor = (_name, processor) => { Processor = processor; };
+        vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'));
+
+        const processor = new Processor();
+        const first = new Int16Array(300);
+        const second = new Int16Array(200);
+        first.fill(16384);
+        second.fill(8192);
+        processor.handleMessage({ type: 'audio', pcm: first, responseId: 'response-a', initialBufferMs: 0 });
+        processor.handleMessage({ type: 'audio', pcm: second, responseId: 'response-b', initialBufferMs: 0 });
+        processor.process([], [[new Float32Array(100)]]);
+        processor.handleMessage({ type: 'revoke', responseId: 'response-a' });
+
+        const assert = (condition, message) => {
+          if (!condition) throw new Error(message);
+        };
+        const progress = messages.find((message) => message.type === 'playback-progress');
+        const revoked = messages.find((message) => message.type === 'playback-revoked');
+        assert(progress.responseId === 'response-a', '80 ms progress must retain response identity');
+        assert(progress.playedMs === 100, 'progress must report actually rendered frames');
+        assert(revoked.responseId === 'response-a', 'revoke must retain response identity');
+        assert(revoked.playedMs === 100, 'revoke must preserve rendered prefix');
+        assert(revoked.revokedMs === 200, 'revoke must remove only the unplayed response suffix');
+        assert(processor.queue.length === 1, 'the next response must remain queued');
+        assert(processor.queue[0].responseId === 'response-b', 'revoke must not clear another response');
         """
     )
     subprocess.run(

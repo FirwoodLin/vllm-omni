@@ -814,7 +814,9 @@ class NativeRuntimeBridgeMixin:
                     {
                         "type": "response.done",
                         "session_id": session.session_id,
+                        "incarnation": session.incarnation,
                         "response_id": response_id,
+                        "item_id": f"item_{response_id}",
                         "epoch": session.epoch,
                         "committed": False,
                         "status": "failed",
@@ -918,7 +920,9 @@ class NativeRuntimeBridgeMixin:
                     {
                         "type": "response.done",
                         "session_id": session.session_id,
+                        "incarnation": session.incarnation,
                         "response_id": response_id,
+                        "item_id": f"item_{response_id}",
                         "epoch": session.epoch,
                         "committed": False,
                         "playback": session.playback.as_dict(),
@@ -1017,7 +1021,7 @@ class NativeRuntimeBridgeMixin:
                 stage_metrics=response_stage_metrics,
             )
             await send_json(speak_payload)
-        previous_sent_ms = session.playback.sent_ms
+        previous_generated_ms = session.playback.generated_ms
         text_chars_before_append = len("".join(session.assistant_text_buffer))
         if isinstance(text, str):
             session.append_assistant_text(text)
@@ -1030,7 +1034,7 @@ class NativeRuntimeBridgeMixin:
         if isinstance(duration_ms, int | float):
             mark_duration_ms = int(duration_ms)
             if native_result.get("audio_duration_is_cumulative") is not True:
-                mark_duration_ms += session.playback.sent_ms
+                mark_duration_ms += session.playback.generated_ms
         audio_text_marks = native_result.get("audio_text_marks")
         audio_text_marks = self._normalize_native_audio_text_marks(
             audio_text_marks if isinstance(audio_text_marks, list) else None,
@@ -1038,13 +1042,13 @@ class NativeRuntimeBridgeMixin:
                 0
                 if native_result.get("audio_text_marks_are_cumulative") is True
                 or native_result.get("audio_duration_is_cumulative") is True
-                else previous_sent_ms
+                else previous_generated_ms
             ),
             text_offset_chars=(
                 0 if native_result.get("audio_text_marks_are_cumulative") is True else text_chars_before_append
             ),
         )
-        session.mark_audio_sent(
+        session.mark_audio_generated(
             mark_duration_ms,
             text_chars=mark_text_chars if mark_duration_ms is not None else None,
             audio_text_marks=audio_text_marks,
@@ -1052,7 +1056,9 @@ class NativeRuntimeBridgeMixin:
         payload = {
             "type": "response.output_audio.delta",
             "session_id": session.session_id,
+            "incarnation": session.incarnation,
             "response_id": response_id,
+            "item_id": f"item_{response_id}",
             "epoch": session.epoch,
             "text": text if isinstance(text, str) else "",
             "audio": audio if isinstance(audio, str) else "",
@@ -1085,6 +1091,7 @@ class NativeRuntimeBridgeMixin:
             stage_metrics=response_stage_metrics,
         )
         await send_json(payload)
+        session.mark_audio_send_enqueued(mark_duration_ms)
         if (
             not end_of_turn
             and native_result.get("stage_role") == "tts"
@@ -1119,7 +1126,9 @@ class NativeRuntimeBridgeMixin:
                 {
                     "type": "response.done",
                     "session_id": session.session_id,
+                    "incarnation": session.incarnation,
                     "response_id": response_id,
+                    "item_id": f"item_{response_id}",
                     "epoch": session.epoch,
                     "committed": committed_message is not None,
                     "playback": session.playback.as_dict(),
@@ -1154,7 +1163,9 @@ class NativeRuntimeBridgeMixin:
             {
                 "type": "response.done",
                 "session_id": session.session_id,
+                "incarnation": session.incarnation,
                 "response_id": response_id,
+                "item_id": f"item_{response_id}",
                 "epoch": session.epoch,
                 "committed": committed_message is not None,
                 "playback": session.playback.as_dict(),

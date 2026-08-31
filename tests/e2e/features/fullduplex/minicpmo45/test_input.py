@@ -177,3 +177,32 @@ def test_pcm_commit_reservation_rollback_restores_residual_audio():
     )
     assert retried.payload is not None
     assert base64.b64decode(retried.payload["audio"]) == (base64.b64decode(original["audio"]) + b"\x00" * (8_000 * 4))
+
+
+def test_buffered_turn_commit_preserves_benchmark_timing_metadata():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    payload = pcm_payload(16_000)
+    payload.update(
+        benchmark_tick_index=7,
+        benchmark_scheduled_monotonic_ns=123_000_000,
+        audio_end_ms=8_000,
+    )
+
+    assert (
+        buffer.prepare_append(
+            payload,
+            operation_id="buffered-turn",
+            chunk_period_ms=1_000,
+            allow_emit=False,
+        )
+        is None
+    )
+    reservation = buffer.prepare_commit(
+        operation_id="commit-buffered-turn",
+        chunk_period_ms=1_000,
+    )
+
+    assert reservation.payload is not None
+    assert reservation.payload["benchmark_tick_index"] == 7
+    assert reservation.payload["benchmark_scheduled_monotonic_ns"] == 123_000_000
+    assert reservation.payload["audio_end_ms"] == 8_000

@@ -631,7 +631,7 @@ class RealtimeOutputProjector:
         duration = event.get("audio_duration_ms")
         playback = event.get("playback")
         if not isinstance(duration, int | float) and isinstance(playback, dict):
-            duration = playback.get("sent_ms") or playback.get("generated_ms")
+            duration = playback.get("send_enqueued_ms") or playback.get("generated_ms")
         if isinstance(duration, int | float):
             state.audio_duration_ms = max(state.audio_duration_ms or 0, int(duration))
         marks = event.get("audio_text_marks")
@@ -710,7 +710,16 @@ class RealtimeOutputProjector:
             else event.get("sample_rate_hz") or format_rate or self._output_sample_rate_hz
         )
         metadata: dict[str, object] = {}
-        for key in ("session_id", "epoch", "model_speak", "end_of_turn", "playback", "vllm_omni"):
+        for key in (
+            "session_id",
+            "incarnation",
+            "epoch",
+            "item_id",
+            "model_speak",
+            "end_of_turn",
+            "playback",
+            "vllm_omni",
+        ):
             if key in event:
                 metadata[key] = event[key]
         duration_ms = event.get("audio_duration_ms")

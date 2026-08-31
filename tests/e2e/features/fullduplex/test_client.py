@@ -174,6 +174,67 @@ def test_realtime_event_collector_partitions_audio_by_response():
     assert collector.last_received_at("response.audio.delta") is not None
 
 
+@pytest.mark.asyncio
+async def test_realtime_client_sends_fenced_terminal_playback_commit():
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+
+    client = Client()
+    response_id = "resp-fenced"
+    client.events.add(
+        {
+            "type": "session.created",
+            "incarnation": 2,
+            "session": {"id": "sid-fenced", "epoch": 7},
+        }
+    )
+    client.events.add(
+        {
+            "type": "response.created",
+            "response": {
+                "id": response_id,
+                "metadata": {
+                    "duplex_event": {
+                        "session_id": "sid-fenced",
+                        "incarnation": 2,
+                        "epoch": 7,
+                    }
+                },
+            },
+        }
+    )
+    client.events.add(
+        {
+            "type": "response.audio.delta",
+            "response_id": response_id,
+            "delta": base64.b64encode(bytes(4800)).decode("ascii"),
+            "sample_rate_hz": 24_000,
+        }
+    )
+
+    await client.acknowledge_playback()
+
+    assert client.sent == [
+        {
+            "type": "playback.ack",
+            "session_id": "sid-fenced",
+            "incarnation": 2,
+            "epoch": 7,
+            "response_id": response_id,
+            "item_id": f"item_{response_id}",
+            "observation_seq": 0,
+            "played_ms": 100,
+            "commit": True,
+            "committed_ms": 100,
+        }
+    ]
+
+
 def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
     collector = RealtimeEventCollector()
     collector.add(
@@ -248,6 +309,13 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
         "chunk_count": 3,
         "response_created_to_first_audio_ms": 200.0,
         "commit_to_first_audio_ms": 300.0,
+        "inter_chunk_intervals_ms": [50.0, 110.0],
+        "chunk_durations_ms": [80.0, 80.0, 80.0],
+        "playout_slack_ms": [30.0, 0.0],
+        "minimum_playout_slack_ms": 0.0,
+        "required_startup_buffer_ms": 0.0,
+        "playout_deadline_miss_count": 0,
+        "streaming_rtf": 1.0,
         "inter_chunk_interval_ms": {
             "count": 2,
             "mean": 80.0,

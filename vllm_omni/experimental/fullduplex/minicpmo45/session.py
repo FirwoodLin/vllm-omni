@@ -27,6 +27,7 @@ class MiniCPMO45ServingSessionState:
     continuation_units: int = 0
     pending_silence_task: asyncio.Task[bool] | None = None
     pending_silence_owner_id: str | None = None
+    last_native_append_started_at: float | None = None
     silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None = None
 
     def retain_committed_audio(

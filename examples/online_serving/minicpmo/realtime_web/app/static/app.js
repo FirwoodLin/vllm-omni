@@ -65,6 +65,10 @@
   let liveUserTurn = null;
   let liveAssistantTurn = null;
   let sessionCloseResolver = null;
+  let sessionPlaybackIdentity = null;
+  const responsePlaybackIdentity = new Map();
+  const playbackObservationSeq = new Map();
+  const revokedResponseIds = new Set();
 
   function staticAssetUrl(path) {
     const version = String(config.appVersion || '').trim();
@@ -284,8 +288,34 @@
     socket.send(JSON.stringify(appendEvent));
   }
 
-  function beginAssistant(responseId) {
+  function duplexEventMetadata(event) {
+    const response = event && event.response;
+    const metadata = response && response.metadata;
+    if (metadata && metadata.duplex_event) return metadata.duplex_event;
+    return (event && event.metadata) || event || {};
+  }
+
+  function rememberPlaybackIdentity(responseId, event) {
+    if (!responseId) return;
+    const metadata = duplexEventMetadata(event);
+    const identity = {
+      session_id: metadata.session_id || (sessionPlaybackIdentity && sessionPlaybackIdentity.session_id),
+      incarnation: Number.isInteger(metadata.incarnation)
+        ? metadata.incarnation : sessionPlaybackIdentity && sessionPlaybackIdentity.incarnation,
+      epoch: Number.isInteger(metadata.epoch)
+        ? metadata.epoch : sessionPlaybackIdentity && sessionPlaybackIdentity.epoch,
+      response_id: responseId,
+      item_id: metadata.item_id || `item_${responseId}`,
+    };
+    if (identity.session_id && Number.isInteger(identity.incarnation) && Number.isInteger(identity.epoch)) {
+      responsePlaybackIdentity.set(responseId, identity);
+    }
+  }
+
+  function beginAssistant(responseId, event) {
     currentResponseId = responseId || currentResponseId;
+    rememberPlaybackIdentity(currentResponseId, event);
+    if (currentResponseId) revokedResponseIds.delete(currentResponseId);
     responseHasAudio = false;
     assistantActive = true;
     setModel('Speaking');
@@ -293,6 +323,10 @@
 
   function feedPlayback(decoded, responseId) {
     if (!decoded || !decoded.pcm || decoded.pcm.length === 0 || !playbackNode) return;
+    if (responseId && revokedResponseIds.has(responseId)) {
+      appendLog(`stale audio dropped for revoked response ${responseId}`);
+      return;
+    }
     const pcm = resampleInt16(decoded.pcm, decoded.sourceRate, playbackRate);
     responseHasAudio = true;
     assistantActive = true;
@@ -310,23 +344,31 @@
     playbackNode.port.postMessage({ type: 'drain', responseId: responseId || currentResponseId });
   }
 
-  function sendPlaybackAck(responseId, playedMs) {
+  function sendPlaybackAck(responseId, playedMs, { commit = false } = {}) {
     if (!responseId || !socket || socket.readyState !== WebSocket.OPEN || playedMs <= 0) {
       if (!responseId && playedMs > 0) appendLog('playback ack skipped: missing response id', true);
       return;
     }
+    const identity = responsePlaybackIdentity.get(responseId);
+    if (!identity) {
+      appendLog(`playback observation skipped: missing identity for ${responseId}`, true);
+      return;
+    }
+    const observationSeq = playbackObservationSeq.get(responseId) || 0;
+    playbackObservationSeq.set(responseId, observationSeq + 1);
     socket.send(JSON.stringify({
       type: 'playback.ack',
-      response_id: responseId,
-      item_id: `item_${responseId}`,
+      ...identity,
+      observation_seq: observationSeq,
       played_ms: playedMs,
-      committed_ms: playedMs,
+      commit,
+      ...(commit ? { committed_ms: playedMs } : {}),
     }));
   }
 
   function playbackDrained(message) {
     const responseId = message.responseId || currentResponseId;
-    sendPlaybackAck(responseId, Number(message.playedMs) || 0);
+    sendPlaybackAck(responseId, Number(message.playedMs) || 0, { commit: true });
     setPlayback('Idle');
     if (message.underrunMs > 0) {
       appendLog(`playback underrun ${message.underrunMs} ms`);
@@ -344,6 +386,14 @@
     const responseId = responseIdOf(event);
     switch (event.type) {
       case 'session.created':
+        {
+          const session = event.session || {};
+          sessionPlaybackIdentity = {
+            session_id: session.id || session.session_id,
+            incarnation: Number.isInteger(event.incarnation) ? event.incarnation : session.incarnation,
+            epoch: Number.isInteger(session.epoch) ? session.epoch : 0,
+          };
+        }
       case 'session.updated':
         setConnection('Connected', 'online');
         setModel('Listening');
@@ -354,10 +404,11 @@
         break;
       case 'response.created':
       case 'response.speak':
-        beginAssistant(responseId);
+        beginAssistant(responseId, event);
         break;
       case 'response.audio.delta':
         currentResponseId = responseId || currentResponseId;
+        rememberPlaybackIdentity(currentResponseId, event);
         assistantActive = true;
         setModel('Speaking');
         decodeAudioDelta(event)
@@ -381,7 +432,17 @@
         break;
       case 'response.done':
         finishTranscript('assistant');
+        if (event.response && event.response.status === 'cancelled' && responseId) {
+          revokedResponseIds.add(responseId);
+          if (playbackNode) playbackNode.port.postMessage({ type: 'revoke', responseId });
+        }
         if (!responseHasAudio) requestPlaybackDrain(responseId);
+        break;
+      case 'output_audio_buffer.cleared':
+        if (responseId) {
+          revokedResponseIds.add(responseId);
+          if (playbackNode) playbackNode.port.postMessage({ type: 'revoke', responseId });
+        }
         break;
       case 'playback.acknowledged':
         {
@@ -409,7 +470,14 @@
     playbackNode = new AudioWorkletNode(playbackContext, 'fullduplex-pcm-playback');
     playbackNode.port.onmessage = (message) => {
       if (message.data.type === 'playback-started') setPlayback('Playing');
+      else if (message.data.type === 'playback-progress') {
+        sendPlaybackAck(message.data.responseId, Number(message.data.playedMs) || 0);
+      }
       else if (message.data.type === 'playback-drained') playbackDrained(message.data);
+      else if (message.data.type === 'playback-revoked') {
+        setPlayback('Idle');
+        appendLog(`playback revoked ${message.data.revokedMs || 0} ms for ${message.data.responseId}`);
+      }
       else if (message.data.type === 'playback-underrun') {
         runtimeDetail.textContent = `Playback underrun ${message.data.underrunMs || 0} ms`;
       }
@@ -634,6 +702,10 @@
     playbackNode = null;
     currentResponseId = null;
     responseHasAudio = false;
+    sessionPlaybackIdentity = null;
+    responsePlaybackIdentity.clear();
+    playbackObservationSeq.clear();
+    revokedResponseIds.clear();
     meterFill.style.width = '0%';
     sessionTimer.textContent = '00:00';
     callButton.textContent = 'Start session';

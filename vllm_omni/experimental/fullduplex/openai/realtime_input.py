@@ -232,15 +232,6 @@ class RealtimeInputTranslator:
                     },
                 }
             )
-            await self._pending_outbound.put(
-                {
-                    "type": "playback.ack",
-                    "item_id": item_id,
-                    "committed_ms": int(audio_end_ms),
-                    "played_ms": int(audio_end_ms),
-                    "truncate": True,
-                }
-            )
             return None
         if event_type == "input_audio_buffer.append":
             audio = event.get("audio") or event.get("delta")
@@ -944,6 +935,8 @@ class RealtimeInputTranslator:
             "force_listen",
             "text",
             "transcript",
+            "benchmark_tick_index",
+            "benchmark_scheduled_monotonic_ns",
         ):
             if key in source:
                 target[key] = source[key]

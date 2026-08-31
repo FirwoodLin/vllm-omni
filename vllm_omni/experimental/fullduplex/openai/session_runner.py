@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import time
 import uuid
 from contextlib import suppress
 from copy import deepcopy
@@ -274,7 +276,7 @@ class DuplexSessionRunnerMixin:
                 return True
             if (
                 session.config.playback_commit_policy == DuplexPlaybackCommitPolicy.ACK_ONLY.value
-                and session.playback.sent_ms > session.playback.committed_ms
+                and session.playback.send_enqueued_ms > session.playback.committed_ms
             ):
                 return True
             if actor.active_response_task is not None and not actor.active_response_task.done():
@@ -319,9 +321,25 @@ class DuplexSessionRunnerMixin:
             retained_committed_payload: dict[str, object] | None = None,
             silence_continuation: bool = False,
             before_append=None,
+            benchmark_tick_index: int | None = None,
+            benchmark_scheduled_monotonic_ns: int | None = None,
+            client_audio_end_ms: int | None = None,
         ) -> asyncio.Task[bool] | None:
             if session is None:
                 return
+            if isinstance(payload, dict):
+                if benchmark_tick_index is None:
+                    candidate = payload.get("benchmark_tick_index")
+                    if isinstance(candidate, int) and not isinstance(candidate, bool):
+                        benchmark_tick_index = candidate
+                if benchmark_scheduled_monotonic_ns is None:
+                    candidate = payload.get("benchmark_scheduled_monotonic_ns")
+                    if isinstance(candidate, int) and not isinstance(candidate, bool):
+                        benchmark_scheduled_monotonic_ns = candidate
+                if client_audio_end_ms is None:
+                    candidate = payload.get("audio_end_ms")
+                    if isinstance(candidate, int | float) and not isinstance(candidate, bool):
+                        client_audio_end_ms = int(candidate)
             if not silence_continuation:
                 mark_pending_silence_superseded()
             append_epoch = session.epoch
@@ -343,14 +361,44 @@ class DuplexSessionRunnerMixin:
                     )
                 )
             precreated_response_id = session.active_response_id if precreate_response else None
+            resolved_operation_id = pcm_reservation.operation_id if pcm_reservation is not None else operation_id
+
+            def log_append_timing(phase: str, monotonic_ns: int, **extra: object) -> None:
+                if os.environ.get("MINICPMO_DUPLEX_TIMING", "0") != "1":
+                    return
+                logger.info(
+                    "MiniCPM-o duplex append timing %s",
+                    json.dumps(
+                        {
+                            "phase": phase,
+                            "session_id": session.session_id,
+                            "kind": "silence" if silence_continuation else "input",
+                            "operation_id": resolved_operation_id,
+                            "benchmark_tick_index": benchmark_tick_index,
+                            "benchmark_scheduled_monotonic_ns": benchmark_scheduled_monotonic_ns,
+                            "client_audio_end_ms": client_audio_end_ms,
+                            "monotonic_ns": monotonic_ns,
+                            **extra,
+                        },
+                        sort_keys=True,
+                    ),
+                )
 
             async def _run() -> bool:
                 nonlocal runtime_closed
+                append_started_ns = time.monotonic_ns()
+                log_append_timing("start", append_started_ns)
                 try:
+                    # Pace synthetic continuation units from input submission
+                    # time. Waiting a full model period after the output comes
+                    # back serializes period + inference latency and makes a
+                    # real-time stream miss its deadline even when inference is
+                    # comfortably faster than one model unit.
+                    native.last_native_append_started_at = asyncio.get_running_loop().time()
                     append_ok, emitted_response = await self._append_runtime_input(
                         session,
                         payload,
-                        operation_id=(pcm_reservation.operation_id if pcm_reservation is not None else operation_id),
+                        operation_id=resolved_operation_id,
                         final=final,
                         send_json=emit_event,
                         mode="append_audio_chunk",
@@ -398,10 +446,25 @@ class DuplexSessionRunnerMixin:
                             await emit_event(
                                 self._turn_controller.signal(session, DuplexTurnEventType.USER_STARTED.value)
                             )
+                    append_finished_ns = time.monotonic_ns()
+                    log_append_timing(
+                        "end",
+                        append_finished_ns,
+                        append_ok=append_ok,
+                        emitted_response=emitted_response,
+                        elapsed_ms=(append_finished_ns - append_started_ns) / 1_000_000.0,
+                    )
                     return append_ok
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    append_failed_ns = time.monotonic_ns()
+                    log_append_timing(
+                        "error",
+                        append_failed_ns,
+                        error_type=type(exc).__name__,
+                        elapsed_ms=(append_failed_ns - append_started_ns) / 1_000_000.0,
+                    )
                     if pcm_reservation is not None:
                         pcm_reservation.rollback()
                     logger.exception("Native duplex append task failed: %s", exc)
@@ -522,26 +585,34 @@ class DuplexSessionRunnerMixin:
             append_tail = actor.native_append_tail
             if (append_tail is None or append_tail.done()) and real_native_input_waiting():
                 return False
-            continuation_delay_s = max(
+            continuation_period_s = max(
                 0.0,
                 float(session.capabilities.chunk_period_ms or 1000) / 1000.0,
             )
+            loop = asyncio.get_running_loop()
+            last_append_started_at = native.last_native_append_started_at
+            continuation_delay_s = continuation_period_s
+            if last_append_started_at is not None:
+                continuation_delay_s = max(
+                    0.0,
+                    last_append_started_at + continuation_period_s - loop.time(),
+                )
             if continuation_delay_s > 0:
                 await asyncio.sleep(continuation_delay_s)
-                if (
-                    actor.native_append_tail is not append_tail
-                    or ((append_tail is None or append_tail.done()) and real_native_input_waiting())
-                    or self._native_silence_continuation_is_stale(
-                        session,
-                        request_id=request_id,
-                        response_id=response_id,
-                        response_owned=response_owned,
-                        expected_epoch=expected_epoch,
-                        expected_incarnation=expected_incarnation,
-                        expected_model_turn_id=expected_model_turn_id,
-                    )
-                ):
-                    return False
+            if (
+                actor.native_append_tail is not append_tail
+                or ((append_tail is None or append_tail.done()) and real_native_input_waiting())
+                or self._native_silence_continuation_is_stale(
+                    session,
+                    request_id=request_id,
+                    response_id=response_id,
+                    response_owned=response_owned,
+                    expected_epoch=expected_epoch,
+                    expected_incarnation=expected_incarnation,
+                    expected_model_turn_id=expected_model_turn_id,
+                )
+            ):
+                return False
 
             def _still_valid() -> bool:
                 return not real_native_input_waiting() and not self._native_silence_continuation_is_stale(
@@ -682,11 +753,11 @@ class DuplexSessionRunnerMixin:
                 created_payload: dict[str, object] = {
                     "type": "session.created",
                     "session": session.as_public_dict(),
+                    "incarnation": session.incarnation,
                 }
                 if session.capabilities.supports_session_resume:
                     created_payload.update(
                         {
-                            "incarnation": session.incarnation,
                             "attachment_generation": attachment_generation,
                             "resume_token": created_attachment.resume_token.plaintext,
                         }
@@ -1238,6 +1309,13 @@ class DuplexSessionRunnerMixin:
                         "sample_rate_hz": sample_rate_hz,
                         "force_listen": force_listen,
                     }
+                    for key in (
+                        "benchmark_tick_index",
+                        "benchmark_scheduled_monotonic_ns",
+                        "audio_end_ms",
+                    ):
+                        if key in event:
+                            payload[key] = event[key]
                     video_frames = event.get("video_frames")
                     if isinstance(video_frames, list):
                         frames = [frame for frame in video_frames if isinstance(frame, str) and frame]
@@ -1428,6 +1506,24 @@ class DuplexSessionRunnerMixin:
                             payload,
                             final=False,
                             pcm_reservation=pcm_reservation,
+                            benchmark_tick_index=(
+                                event.get("benchmark_tick_index")
+                                if isinstance(event.get("benchmark_tick_index"), int)
+                                and not isinstance(event.get("benchmark_tick_index"), bool)
+                                else None
+                            ),
+                            benchmark_scheduled_monotonic_ns=(
+                                event.get("benchmark_scheduled_monotonic_ns")
+                                if isinstance(event.get("benchmark_scheduled_monotonic_ns"), int)
+                                and not isinstance(event.get("benchmark_scheduled_monotonic_ns"), bool)
+                                else None
+                            ),
+                            client_audio_end_ms=(
+                                int(event["audio_end_ms"])
+                                if isinstance(event.get("audio_end_ms"), int | float)
+                                and not isinstance(event.get("audio_end_ms"), bool)
+                                else None
+                            ),
                         )
                         continue
                     if session.capabilities.supports_input_append:

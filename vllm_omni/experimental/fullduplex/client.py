@@ -205,6 +205,48 @@ class RealtimeEventCollector:
     def errors(self) -> list[dict[str, object]]:
         return [event for event in self.events if event.get("type") == "error"]
 
+    def playback_identity(self, response_id: str) -> dict[str, object]:
+        session_id: str | None = None
+        incarnation: int | None = None
+        epoch: int | None = None
+        for event in self.events:
+            if event.get("type") == "session.created":
+                session = event.get("session")
+                if isinstance(session, dict):
+                    raw_session_id = session.get("id") or session.get("session_id")
+                    if isinstance(raw_session_id, str) and raw_session_id:
+                        session_id = raw_session_id
+                    raw_epoch = session.get("epoch")
+                    if isinstance(raw_epoch, int) and not isinstance(raw_epoch, bool):
+                        epoch = raw_epoch
+                raw_incarnation = event.get("incarnation")
+                if isinstance(raw_incarnation, int) and not isinstance(raw_incarnation, bool):
+                    incarnation = raw_incarnation
+            if event.get("type") != "response.created" or self.response_id(event) != response_id:
+                continue
+            response = event.get("response")
+            metadata = response.get("metadata") if isinstance(response, dict) else None
+            duplex_event = metadata.get("duplex_event") if isinstance(metadata, dict) else None
+            if isinstance(duplex_event, dict):
+                raw_session_id = duplex_event.get("session_id")
+                raw_incarnation = duplex_event.get("incarnation")
+                raw_epoch = duplex_event.get("epoch")
+                if isinstance(raw_session_id, str) and raw_session_id:
+                    session_id = raw_session_id
+                if isinstance(raw_incarnation, int) and not isinstance(raw_incarnation, bool):
+                    incarnation = raw_incarnation
+                if isinstance(raw_epoch, int) and not isinstance(raw_epoch, bool):
+                    epoch = raw_epoch
+        if session_id is None or incarnation is None or epoch is None:
+            raise RuntimeError(f"Missing playback identity for response {response_id}")
+        return {
+            "session_id": session_id,
+            "incarnation": incarnation,
+            "epoch": epoch,
+            "response_id": response_id,
+            "item_id": f"item_{response_id}",
+        }
+
     def first_received_at(
         self,
         *event_types: str,
@@ -305,10 +347,37 @@ class RealtimeEventCollector:
                     duration_ms - previous_duration_ms if duration_ms >= previous_duration_ms else duration_ms
                 )
                 previous_duration_ms = duration_ms
+            playout_slack_ms: list[float] = []
+            if len(chunk_durations_ms) == len(audio_received_at_s):
+                audio_available_ms = 0.0
+                first_audio_at_s = audio_received_at_s[0]
+                for index in range(1, len(audio_received_at_s)):
+                    audio_available_ms += max(0.0, chunk_durations_ms[index - 1])
+                    arrival_elapsed_ms = (audio_received_at_s[index] - first_audio_at_s) * 1000.0
+                    playout_slack_ms.append(audio_available_ms - arrival_elapsed_ms)
+            streaming_audio_ms = sum(max(0.0, duration) for duration in chunk_durations_ms[:-1])
+            streaming_generation_ms = (
+                max(0.0, (audio_received_at_s[-1] - audio_received_at_s[0]) * 1000.0)
+                if len(audio_received_at_s) > 1
+                else 0.0
+            )
             interval_summary = _interval_summary(intervals_ms)
             result["audio_output"] = {
                 "source": "client_monotonic_receive",
                 "chunk_count": len(audio_received_at_s),
+                "inter_chunk_intervals_ms": [_rounded_ms(value) for value in intervals_ms],
+                "chunk_durations_ms": [_rounded_ms(value) for value in chunk_durations_ms],
+                "playout_slack_ms": [_rounded_ms(value) for value in playout_slack_ms],
+                "minimum_playout_slack_ms": (_rounded_ms(min(playout_slack_ms)) if playout_slack_ms else None),
+                "required_startup_buffer_ms": (
+                    _rounded_ms(max(0.0, -min(playout_slack_ms))) if playout_slack_ms else 0.0
+                ),
+                # Ignore sub-microsecond floating-point residue from monotonic
+                # timestamp subtraction at an exact playback boundary.
+                "playout_deadline_miss_count": sum(value < -0.001 for value in playout_slack_ms),
+                "streaming_rtf": (
+                    round(streaming_generation_ms / streaming_audio_ms, 6) if streaming_audio_ms > 0 else None
+                ),
                 "response_created_to_first_audio_ms": (
                     _rounded_ms((audio_received_at_s[0] - response_created_at_s) * 1000.0)
                     if response_created_at_s is not None
@@ -374,6 +443,7 @@ class RealtimeDuplexClient:
         self.events = RealtimeEventCollector()
         self._ws: Any = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._playback_observation_seq: dict[str, int] = {}
 
     async def __aenter__(self) -> RealtimeDuplexClient:
         self._ws = await websockets.connect(self.url, max_size=self.max_size)
@@ -498,12 +568,15 @@ class RealtimeDuplexClient:
             if not pcm16:
                 continue
             played_ms = len(pcm16) * 1000 // (self.events.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
+            observation_seq = self._playback_observation_seq.get(response_id, 0)
+            self._playback_observation_seq[response_id] = observation_seq + 1
             await self.send(
                 {
                     "type": "playback.ack",
-                    "response_id": response_id,
-                    "item_id": f"item_{response_id}",
+                    **self.events.playback_identity(response_id),
+                    "observation_seq": observation_seq,
                     "played_ms": played_ms,
+                    "commit": True,
                     "committed_ms": played_ms,
                 }
             )

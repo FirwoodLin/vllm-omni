@@ -6,6 +6,7 @@ import pytest
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexCapabilities,
     DuplexOverlapPolicy,
+    DuplexPlaybackAckError,
     DuplexSession,
     DuplexSessionConfig,
     DuplexSessionRegistry,
@@ -350,10 +351,10 @@ def test_duplex_session_composes_single_owner_ledgers():
     assert session.active_request_id == "req-1"
     assert session.active_response_id == response_id
     assert session.active_response_turn_id == 3
-    assert session.playback.sent_ms == 240
+    assert session.playback.send_enqueued_ms == 240
 
     try:
-        session.playback.sent_ms = 480
+        session.playback.send_enqueued_ms = 480
     except (AttributeError, TypeError):
         pass
     else:
@@ -387,9 +388,83 @@ def test_duplex_playback_ack_tracks_committed_cursor_separately():
     session.acknowledge_playback(played_ms=2_000)
 
     assert session.playback.generated_ms == 10_000
-    assert session.playback.sent_ms == 10_000
+    assert session.playback.send_enqueued_ms == 10_000
     assert session.playback.played_ms == 2_000
     assert session.playback.committed_ms == 2_000
+
+
+def test_duplex_playback_observation_is_fenced_bounded_and_separate_from_commit():
+    session = DuplexSession(session_id="sid-playback-fence", config=DuplexSessionConfig(), incarnation=3)
+    response_id = session.begin_response()
+    item_id = f"item_{response_id}"
+
+    session.mark_audio_generated(1000)
+    assert session.playback.generated_ms == 1000
+    assert session.playback.send_enqueued_ms == 0
+    with pytest.raises(ValueError, match="cannot exceed generated"):
+        session.mark_audio_send_enqueued(1001)
+    session.mark_audio_send_enqueued(800)
+
+    observed = session.acknowledge_playback_observation(
+        session_id=session.session_id,
+        incarnation=session.incarnation,
+        epoch=session.epoch,
+        response_id=response_id,
+        item_id=item_id,
+        observation_seq=0,
+        played_ms=400,
+    )
+    assert observed.played_ms == 400
+    assert observed.committed_ms == 0
+
+    with pytest.raises(DuplexPlaybackAckError) as over_ack:
+        session.acknowledge_playback_observation(
+            session_id=session.session_id,
+            incarnation=session.incarnation,
+            epoch=session.epoch,
+            response_id=response_id,
+            item_id=item_id,
+            observation_seq=1,
+            played_ms=801,
+        )
+    assert over_ack.value.code == "playback_cursor_out_of_bounds"
+
+    with pytest.raises(DuplexPlaybackAckError) as stale_sequence:
+        session.acknowledge_playback_observation(
+            session_id=session.session_id,
+            incarnation=session.incarnation,
+            epoch=session.epoch,
+            response_id=response_id,
+            item_id=item_id,
+            observation_seq=0,
+            played_ms=400,
+        )
+    assert stale_sequence.value.code == "out_of_order_playback_ack"
+
+
+def test_repeated_partial_commit_after_response_done_derives_from_immutable_full_message():
+    session = DuplexSession(session_id="sid-immutable-response", config=DuplexSessionConfig())
+    response_id = session.begin_response()
+    item_id = f"item_{response_id}"
+    session.append_assistant_text("abcdefghij")
+    session.mark_audio_sent(1000, text_chars=10)
+    assert session.end_response(commit_text=False) is None
+    session.register_history_item(item_id, None)
+
+    for observation_seq, played_ms in ((0, 400), (1, 400), (2, 800)):
+        playback = session.acknowledge_playback_observation(
+            session_id=session.session_id,
+            incarnation=session.incarnation,
+            epoch=session.epoch,
+            response_id=response_id,
+            item_id=item_id,
+            observation_seq=observation_seq,
+            played_ms=played_ms,
+            committed_ms=played_ms,
+        )
+        assert session.truncate_history_item(item_id, audio_end_ms=played_ms, playback=playback)
+
+    assert session.history == ({"role": "assistant", "content": "abcdefgh"},)
 
 
 def test_duplex_history_commit_uses_audio_text_alignment_marks():
@@ -428,6 +503,8 @@ def test_duplex_capabilities_do_not_claim_core_kv_or_input_append():
 
     assert caps["implementation_level"] == "serving_session_adapter"
     assert caps["supports_kv_lease"] is False
+    assert caps["playback_ack_contract_version"] == 2
+    assert caps["playback_observation_period_ms"] == 80
     assert caps["supports_input_append"] is False
     assert caps["supports_reencode_context"] is True
     assert caps["adapter_patterns"] == ["chunk_group_append"]

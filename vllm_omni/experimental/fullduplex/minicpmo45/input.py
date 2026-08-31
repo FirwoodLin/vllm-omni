@@ -13,6 +13,9 @@ class _PcmSpan:
     byte_count: int
     force_listen: bool
     is_speech: bool
+    benchmark_tick_index: int | None = None
+    benchmark_scheduled_monotonic_ns: int | None = None
+    audio_end_ms: int | None = None
 
 
 class MiniCPMO45PcmAppendReservation:
@@ -128,7 +131,17 @@ class MiniCPMO45PcmAppendBuffer:
         self._turn_had_speech = False
 
     def clear_force_listen(self) -> None:
-        self._spans = [_PcmSpan(span.byte_count, False, span.is_speech) for span in self._spans]
+        self._spans = [
+            _PcmSpan(
+                span.byte_count,
+                False,
+                span.is_speech,
+                span.benchmark_tick_index,
+                span.benchmark_scheduled_monotonic_ns,
+                span.audio_end_ms,
+            )
+            for span in self._spans
+        ]
 
     def has_pending(self) -> bool:
         return bool(self._buffer)
@@ -147,12 +160,18 @@ class MiniCPMO45PcmAppendBuffer:
             self._spans
             and self._spans[-1].force_listen == span.force_listen
             and self._spans[-1].is_speech == span.is_speech
+            and self._spans[-1].benchmark_tick_index == span.benchmark_tick_index
+            and self._spans[-1].benchmark_scheduled_monotonic_ns == span.benchmark_scheduled_monotonic_ns
+            and self._spans[-1].audio_end_ms == span.audio_end_ms
         ):
             previous = self._spans[-1]
             self._spans[-1] = _PcmSpan(
                 previous.byte_count + span.byte_count,
                 span.force_listen,
                 span.is_speech,
+                span.benchmark_tick_index,
+                span.benchmark_scheduled_monotonic_ns,
+                span.audio_end_ms,
             )
             return
         self._spans.append(span)
@@ -165,7 +184,16 @@ class MiniCPMO45PcmAppendBuffer:
                 raise RuntimeError("MiniCPM-o PCM metadata is shorter than buffered audio")
             span = self._spans.pop(0)
             take = min(remaining, span.byte_count)
-            consumed.append(_PcmSpan(take, span.force_listen, span.is_speech))
+            consumed.append(
+                _PcmSpan(
+                    take,
+                    span.force_listen,
+                    span.is_speech,
+                    span.benchmark_tick_index,
+                    span.benchmark_scheduled_monotonic_ns,
+                    span.audio_end_ms,
+                )
+            )
             if take < span.byte_count:
                 self._spans.insert(
                     0,
@@ -173,6 +201,9 @@ class MiniCPMO45PcmAppendBuffer:
                         span.byte_count - take,
                         span.force_listen,
                         span.is_speech,
+                        span.benchmark_tick_index,
+                        span.benchmark_scheduled_monotonic_ns,
+                        span.audio_end_ms,
                     ),
                 )
             remaining -= take
@@ -244,6 +275,24 @@ class MiniCPMO45PcmAppendBuffer:
                 len(raw),
                 bool(payload.get("force_listen", False)),
                 bool(payload.get("is_speech", False)),
+                (
+                    payload.get("benchmark_tick_index")
+                    if isinstance(payload.get("benchmark_tick_index"), int)
+                    and not isinstance(payload.get("benchmark_tick_index"), bool)
+                    else None
+                ),
+                (
+                    payload.get("benchmark_scheduled_monotonic_ns")
+                    if isinstance(payload.get("benchmark_scheduled_monotonic_ns"), int)
+                    and not isinstance(payload.get("benchmark_scheduled_monotonic_ns"), bool)
+                    else None
+                ),
+                (
+                    int(payload["audio_end_ms"])
+                    if isinstance(payload.get("audio_end_ms"), int | float)
+                    and not isinstance(payload.get("audio_end_ms"), bool)
+                    else None
+                ),
             )
         )
         frames_in = payload.get("video_frames")
@@ -294,6 +343,17 @@ class MiniCPMO45PcmAppendBuffer:
             out["video_frames"] = attached_frames
         out["force_listen"] = any(span.force_listen for span in reserved_spans)
         out["is_speech"] = any(span.is_speech for span in reserved_spans)
+        for key in (
+            "benchmark_tick_index",
+            "benchmark_scheduled_monotonic_ns",
+            "audio_end_ms",
+        ):
+            value = next(
+                (getattr(span, key) for span in reversed(reserved_spans) if getattr(span, key) is not None),
+                None,
+            )
+            if value is not None:
+                out[key] = value
         reservation = MiniCPMO45PcmAppendReservation(
             owner=self,
             operation_id=operation_id,

@@ -27,6 +27,7 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexCapabilities,
     DuplexCommittedInput,
     DuplexOverlapPolicy,
+    DuplexPlaybackAckError,
     DuplexPlaybackCommitPolicy,
     DuplexSession,
     DuplexSessionConfig,
@@ -415,7 +416,9 @@ class OmniDuplexSessionHandler(
         payload: dict[str, object] = {
             "type": "response.created",
             "session_id": session.session_id,
+            "incarnation": session.incarnation,
             "response_id": response_id,
+            "item_id": f"item_{response_id}",
             "epoch": epoch,
             "modalities": list(response_config.modalities),
         }
@@ -779,7 +782,7 @@ class OmniDuplexSessionHandler(
     def _assistant_playback_active(session: DuplexSession) -> bool:
         return (
             session.config.playback_commit_policy == DuplexPlaybackCommitPolicy.ACK_ONLY.value
-            and session.playback.sent_ms > session.playback.committed_ms
+            and session.playback.send_enqueued_ms > session.playback.committed_ms
         )
 
     @staticmethod
@@ -1312,7 +1315,7 @@ class OmniDuplexSessionHandler(
             }
         if isinstance(model, str) and session.config.model is None:
             session.config.model = model
-        if isinstance(voice, str) and (session.playback.generated_ms > 0 or session.playback.sent_ms > 0):
+        if isinstance(voice, str) and (session.playback.generated_ms > 0 or session.playback.send_enqueued_ms > 0):
             return {
                 "type": "error",
                 "session_id": session.session_id,
@@ -1581,98 +1584,136 @@ class OmniDuplexSessionHandler(
         return None
 
     async def _handle_playback_ack(self, session: DuplexSession, event: dict[str, object], send_json) -> None:
-        played_ms = event.get("played_ms", event.get("audio_ms", 0))
-        committed_ms = event.get("committed_ms")
-        if not isinstance(played_ms, int | float):
-            await send_json({"type": "error", "error": "playback.ack requires played_ms", "code": "bad_event"})
+        required = ("session_id", "incarnation", "epoch", "response_id", "item_id", "observation_seq", "played_ms")
+        missing = [name for name in required if name not in event]
+        if missing:
+            await send_json(
+                {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "code": "missing_playback_identity",
+                    "error": f"playback.ack missing required fields: {', '.join(missing)}",
+                }
+            )
             return
-        committed_cursor = int(committed_ms) if isinstance(committed_ms, int | float) else int(played_ms)
-        item_id = event.get("item_id")
+
+        session_id = event.get("session_id")
+        incarnation = event.get("incarnation")
+        epoch = event.get("epoch")
         response_id = event.get("response_id")
-        response_id = response_id if isinstance(response_id, str) and response_id else None
-        if not isinstance(item_id, str) or not item_id:
-            item_id = f"item_{response_id}" if response_id is not None else None
-        elif response_id is None and item_id.startswith("item_"):
-            response_id = item_id.removeprefix("item_")
-        if response_id is None and item_id is None and len(session.pending_history_item_ids) == 1:
-            item_id = next(iter(session.pending_history_item_ids))
-            if item_id.startswith("item_"):
-                response_id = item_id.removeprefix("item_")
-        if response_id is None and item_id is None and session.active_response_id is not None:
-            response_id = session.active_response_id
-            item_id = f"item_{response_id}"
-        if event.get("truncate") is True:
-            playback = session.acknowledge_playback(
-                int(played_ms),
-                committed_cursor,
-                response_id=response_id,
+        item_id = event.get("item_id")
+        observation_seq = event.get("observation_seq")
+        played_ms = event.get("played_ms")
+        typed_identity = (
+            isinstance(session_id, str)
+            and bool(session_id)
+            and isinstance(response_id, str)
+            and bool(response_id)
+            and isinstance(item_id, str)
+            and bool(item_id)
+            and isinstance(incarnation, int)
+            and not isinstance(incarnation, bool)
+            and isinstance(epoch, int)
+            and not isinstance(epoch, bool)
+            and isinstance(observation_seq, int)
+            and not isinstance(observation_seq, bool)
+            and observation_seq >= 0
+            and isinstance(played_ms, int)
+            and not isinstance(played_ms, bool)
+            and played_ms >= 0
+        )
+        if not typed_identity:
+            await send_json(
+                {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "code": "bad_playback_observation",
+                    "error": "playback.ack identity, sequence, and cursor fields must be non-negative typed values",
+                }
             )
-            playback = session.truncate_playback_commit(
-                committed_cursor,
-                response_id=response_id,
+            return
+
+        commit = event.get("commit", False)
+        committed_ms = event.get("committed_ms")
+        if not isinstance(commit, bool):
+            await send_json(
+                {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "code": "bad_playback_commit",
+                    "error": "playback.ack commit must be a boolean",
+                }
             )
-        else:
-            playback = session.acknowledge_playback(
-                int(played_ms),
-                committed_cursor,
-                response_id=response_id,
+            return
+        if commit:
+            if not isinstance(committed_ms, int) or isinstance(committed_ms, bool) or committed_ms < 0:
+                await send_json(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "code": "bad_playback_commit",
+                        "error": "committing playback.ack requires non-negative committed_ms",
+                    }
+                )
+                return
+        elif committed_ms is not None:
+            await send_json(
+                {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "code": "playback_commit_not_explicit",
+                    "error": "committed_ms requires commit=true; played observations do not mutate history",
+                }
             )
+            return
+
+        try:
+            playback = session.acknowledge_playback_observation(
+                session_id=session_id,
+                incarnation=incarnation,
+                epoch=epoch,
+                response_id=response_id,
+                item_id=item_id,
+                observation_seq=observation_seq,
+                played_ms=played_ms,
+                committed_ms=committed_ms if commit else None,
+            )
+        except DuplexPlaybackAckError as exc:
+            await send_json(
+                {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "response_id": response_id,
+                    "item_id": item_id,
+                    "code": exc.code,
+                    "error": str(exc),
+                }
+            )
+            return
+
         committed_history = False
-        if isinstance(item_id, str) and item_id:
+        if commit:
             committed_history = session.truncate_history_item(
                 item_id,
-                audio_end_ms=committed_cursor,
+                audio_end_ms=committed_ms,
                 playback=playback,
             )
-        elif session.pending_history_item_ids:
-            # A plain playback ack has no OpenAI item id. Commit the only
-            # uncommitted assistant candidate if the session has an unambiguous
-            # pending response; otherwise wait for conversation.item.truncate.
-            pending_ids = list(session.pending_history_item_ids)
-            if len(pending_ids) == 1:
-                item_id = pending_ids[0]
-                committed_history = session.truncate_history_item(
-                    item_id,
-                    audio_end_ms=committed_cursor,
-                    playback=playback,
-                )
-        elif session.active_response_id is not None:
-            item_id = f"item_{session.active_response_id}"
-            committed_history = session.truncate_history_item(
-                item_id,
-                audio_end_ms=committed_cursor,
-                playback=playback,
-            )
-        elif session.last_assistant_full_message is not None:
-            if item_id is None and session.history_item_ids:
-                assistant_item_ids = [
-                    known_item_id
-                    for known_item_id, message in session.history_item_ids.items()
-                    if message.get("role") == "assistant"
-                ]
-                if len(assistant_item_ids) == 1:
-                    item_id = assistant_item_ids[0]
-            if isinstance(item_id, str) and item_id:
-                committed_history = session.truncate_history_item(
-                    item_id,
-                    audio_end_ms=committed_cursor,
-                    playback=playback,
-                )
         await send_json(
             {
                 "type": "playback.acknowledged",
                 "session_id": session.session_id,
-                "epoch": session.epoch,
+                "incarnation": session.incarnation,
+                "epoch": epoch,
+                "response_id": response_id,
                 "item_id": item_id,
-                "played_ms": int(played_ms),
-                "committed_ms": committed_cursor,
-                "truncate": event.get("truncate") is True,
+                "observation_seq": observation_seq,
+                "played_ms": played_ms,
+                "committed_ms": playback.committed_ms,
+                "commit": commit,
                 "playback": playback.as_dict(),
                 "history_committed": committed_history,
             }
         )
-        if committed_history and committed_cursor >= max(playback.sent_ms, playback.generated_ms):
-            session.release_response_playback(response_id)
 
     async def _cancel_active_response(
         self,
@@ -1690,7 +1731,12 @@ class OmniDuplexSessionHandler(
         old_epoch = session.epoch
         old_request_id = session.active_request_id
         old_response_id = session.active_response_id
-        committed_ms = session.playback.committed_ms
+        # Cancellation is a semantic boundary: commit the latest validated
+        # actual-render observation once, instead of mutating history on every
+        # periodic observation.
+        committed_ms = session.playback.played_ms
+        if old_response_id is not None and committed_ms > session.playback.committed_ms:
+            session.truncate_playback_commit(committed_ms, response_id=old_response_id)
         committed_message = session.end_response(
             commit_text=self._should_commit_response_to_history(session, old_response_id),
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
