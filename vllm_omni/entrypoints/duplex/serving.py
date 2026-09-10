@@ -1972,6 +1972,10 @@ class OmniDuplexSessionHandler(
                 }
             )
             return
+        # Reserve the response's current history position before any later
+        # input commit can append a user item.  A 0 ms ACK is intentional:
+        # the response may be active but have no audio delta yet.
+        session.reserve_history_item(item_id)
         hard_truncate = event.get("truncate") is True
 
         commit = event.get("commit", False)
