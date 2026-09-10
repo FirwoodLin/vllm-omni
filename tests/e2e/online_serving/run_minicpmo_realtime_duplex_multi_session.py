@@ -675,7 +675,7 @@ async def _open_admission_session(
                     "session_id": session_id,
                     "model": args.model,
                     "modalities": ["audio", "text"],
-                    "extra_body": {"minicpmo45_native_duplex": True},
+                    "extra_body": {"native_duplex": True},
                     **({"ref_audio": _ref_audio_data_url(args.ref_audio)} if getattr(args, "ref_audio", None) else {}),
                 },
             }
@@ -718,7 +718,7 @@ async def _admission_probe(args: argparse.Namespace, *, limit: int) -> dict[str,
                             "session_id": overflow_id,
                             "model": args.model,
                             "modalities": ["audio", "text"],
-                            "extra_body": {"minicpmo45_native_duplex": True},
+                            "extra_body": {"native_duplex": True},
                             **(
                                 {"ref_audio": _ref_audio_data_url(args.ref_audio)}
                                 if getattr(args, "ref_audio", None)
@@ -784,7 +784,7 @@ async def _resume_probe(
                         "session_id": session_id,
                         "model": args.model,
                         "modalities": ["audio", "text"],
-                        "extra_body": {"minicpmo45_native_duplex": True},
+                        "extra_body": {"native_duplex": True},
                         **(
                             {"ref_audio": _ref_audio_data_url(args.ref_audio)}
                             if getattr(args, "ref_audio", None)
@@ -889,7 +889,7 @@ async def _takeover_probe(
                         "session_id": session_id,
                         "model": args.model,
                         "modalities": ["audio", "text"],
-                        "extra_body": {"minicpmo45_native_duplex": True},
+                        "extra_body": {"native_duplex": True},
                         **(
                             {"ref_audio": _ref_audio_data_url(args.ref_audio)}
                             if getattr(args, "ref_audio", None)

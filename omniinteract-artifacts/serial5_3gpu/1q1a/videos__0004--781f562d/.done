@@ -1,0 +1,671 @@
+{
+  "subset": "1q1a",
+  "video": "/mnt/models_2296/OmniInteract/data/1q1a/videos/0004.mp4",
+  "output_dir": "/app/vllm-omni/omniinteract-artifacts/serial5_3gpu/1q1a/videos__0004--781f562d",
+  "success": true,
+  "error": "",
+  "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+  "latency_s": 154.57152246823534,
+  "input_audio_chunks": 755,
+  "input_video_frames": 151,
+  "pacing_mean_lag_s": 0.0007737591313753302,
+  "pacing_max_lag_s": 0.002206107974046745,
+  "responses": 15,
+  "audio_bytes": 2557440,
+  "audio_clipped_bytes": 0,
+  "transcript": "没错这会儿没有 好的 现在是10，还没出现单杠哦。 注意！出现单杠了。 现在数字变成了 85。 目前画面中没有数字了。 看起来像是一个操场。 刚才那个数字最大的是10。 地上有很多落叶。 感觉是在秋天。 画面里还有很多树。 当然可以。 这是一个红色的牌子。 牌子上的字是“年”。 牌子旁边开着红色的花。注意，出现数字五了。",
+  "eligible_for_official_eval": true,
+  "official_eval_ineligible_reasons": [],
+  "artifact_warnings": [],
+  "output_tokens": 238,
+  "duplex_request_metrics": [
+    {
+      "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+      "request_index": 0,
+      "response_id": "resp-omniinteract:1q1a:bench-5b610dd7-3:2766875759285887-0-57023b69",
+      "source": "client_monotonic_receive",
+      "measurement_origin": {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration"
+      },
+      "ttft_ms": 0.122,
+      "ttfp_ms": 0.09,
+      "rtf": 0.896992,
+      "audio_generation_ms": 3910.884,
+      "audio_duration_ms": 4360.0,
+      "stage0_tokens": {
+        "source": "engine_stage_metrics",
+        "output_token_count": 17,
+        "ttft_ms": 52.468061447143555,
+        "tpot_ms": 7.6504661701619625,
+        "itls_ms": [
+          6.991914007812738,
+          6.893239915370941,
+          6.824733689427376,
+          6.884644273668528,
+          6.797489710152149,
+          6.894129328429699,
+          10.161560960114002,
+          9.544122964143753,
+          6.747548934072256,
+          6.887298077344894,
+          10.361122898757458,
+          6.8177892826497555
+        ],
+        "inter_token_interval_ms": {
+          "count": 12,
+          "mean": 7.651,
+          "p50": 6.887,
+          "p95": 10.361,
+          "max": 10.361
+        }
+      }
+    },
+    {
+      "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+      "request_index": 1,
+      "response_id": "resp-omniinteract:1q1a:bench-5b610dd7-3:2766875759285887-0-9a452b43",
+      "source": "client_monotonic_receive",
+      "measurement_origin": {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration"
+      },
+      "ttft_ms": 0.151,
+      "ttfp_ms": 0.114,
+      "rtf": 0.866633,
+      "audio_generation_ms": 2010.589,
+      "audio_duration_ms": 2320.0,
+      "stage0_tokens": {
+        "source": "engine_stage_metrics",
+        "output_token_count": 8,
+        "ttft_ms": 50.7051944732666,
+        "tpot_ms": 6.900753267109394,
+        "itls_ms": [
+          6.8329921923577785,
+          6.837212946265936,
+          6.802344229072332,
+          6.895906757563353,
+          7.135310210287571
+        ],
+        "inter_token_interval_ms": {
+          "count": 5,
+          "mean": 6.901,
+          "p50": 6.837,
+          "p95": 7.135,
+          "max": 7.135
+        }
+      }
+    },
+    {
+      "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+      "request_index": 2,
+      "response_id": "resp-omniinteract:1q1a:bench-5b610dd7-3:2766875759285887-0-09932dda",
+      "source": "client_monotonic_receive",
+      "measurement_origin": {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration"
+      },
+      "ttft_ms": 0.36,
+      "ttfp_ms": 0.231,
+      "rtf": 0.826344,
+      "audio_generation_ms": 5090.277,
+      "audio_duration_ms": 6160.0,
+      "stage0_tokens": {
+        "source": "engine_stage_metrics",
+        "output_token_count": 25,
+        "ttft_ms": 50.34184455871582,
+        "tpot_ms": 8.121669194415995,
+        "itls_ms": [
+          9.816116653382778,
+          6.748732179403305,
+          6.833925843238831,
+          10.128762107342482,
+          9.611643850803375,
+          10.00495906919241,
+          6.697931792587042,
+          6.668432150036097,
+          6.814362946897745,
+          6.935358047485352,
+          6.862570997327566,
+          6.940898019820452,
+          10.03899797797203,
+          10.290379170328379,
+          9.632417000830173,
+          10.194006841629744,
+          6.6882842220366,
+          6.694655865430832,
+          6.7092799581587315
+        ],
+        "inter_token_interval_ms": {
+          "count": 19,
+          "mean": 8.122,
+          "p50": 6.935,
+          "p95": 10.29,
+          "max": 10.29
+        }
+      }
+    },
+    {
+      "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+      "request_index": 3,
+      "response_id": "resp-omniinteract:1q1a:bench-5b610dd7-3:2766875759285887-0-1aca78a2",
+      "source": "client_monotonic_receive",
+      "measurement_origin": {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration"
+      },
+      "ttft_ms": 0.388,
+      "ttfp_ms": 0.235,
+      "rtf": 0.635383,
+      "audio_generation_ms": 2007.811,
+      "audio_duration_ms": 3160.0,
+      "stage0_tokens": {
+        "source": "engine_stage_metrics",
+        "output_token_count": 13,
+        "ttft_ms": 53.65324020385742,
+        "tpot_ms": 8.384927501901984,
+        "itls_ms": [
+          10.215774644166231,
+          9.674356319010258,
+          10.069943964481354,
+          9.549057111144066,
+          6.705850828438997,
+          6.926164962351322,
+          10.309411212801933,
+          6.789701990783215,
+          6.727900821715593,
+          6.881113164126873
+        ],
+        "inter_token_interval_ms": {
+          "count": 10,
+          "mean": 8.385,
+          "p50": 6.926,
+          "p95": 10.309,
+          "max": 10.309
+        }
+      }
+    },
+    {
+      "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+      "request_index": 4,
+      "response_id": "resp-omniinteract:1q1a:bench-5b610dd7-3:2766875759285887-0-906f15ba",
+      "source": "client_monotonic_receive",
+      "measurement_origin": {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration"
+      },
+      "ttft_ms": 0.438,
+      "ttfp_ms": 0.28,
+      "rtf": 0.632224,
+      "audio_generation_ms": 1972.538,
+      "audio_duration_ms": 3120.0,
+      "stage0_tokens": {
+        "source": "engine_stage_metrics",
+        "output_token_count": 12,
+        "ttft_ms": 55.25827407836914,
+        "tpot_ms": 8.358598324573702,
+        "itls_ms": [
+          10.516144800931215,
+          9.86659899353981,
+          10.28126711025834,
+          6.7493608221411705,
+          6.695148069411516,
+          10.344637092202902,
+          7.305184844881296,
+          6.564234383404255,
+          6.904808804392815
+        ],
+        "inter_token_interval_ms": {
+          "count": 9,
+          "mean": 8.359,
+          "p50": 7.305,
+          "p95": 10.516,
+          "max": 10.516
+        }
+      }
+    },
+    {
+      "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+      "request_index": 5,
+      "response_id": "resp-omniinteract:1q1a:bench-5b610dd7-3:2766875759285887-0-ce9ad40b",
+      "source": "client_monotonic_receive",
+      "measurement_origin": {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration"
+      },
+      "ttft_ms": 0.353,
+      "ttfp_ms": 0.213,
+      "rtf": 0.88759,
+      "audio_generation_ms": 3976.404,
+      "audio_duration_ms": 4480.0,
+      "stage0_tokens": {
+        "source": "engine_stage_metrics",
+        "output_token_count": 18,
+        "ttft_ms": 53.91287803649902,
+        "tpot_ms": 7.957450687312162,
+        "itls_ms": [
+          6.834620144218206,
+          6.872394122183323,
+          6.908272858709097,
+          7.038770243525505,
+          10.658244136720896,
+          9.998522233217955,
+          6.845640949904919,
+          6.795471999794245,
+          10.126334149390459,
+          10.700402781367302,
+          6.844155956059694,
+          6.693629082292318,
+          7.130400277674198
+        ],
+        "inter_token_interval_ms": {
+          "count": 13,
+          "mean": 7.957,
+          "p50": 6.908,
+          "p95": 10.7,
+          "max": 10.7
+        }
+      }
+    },
+    {
+      "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+      "request_index": 6,
+      "response_id": "resp-omniinteract:1q1a:bench-5b610dd7-3:2766875759285887-0-741e5bec",
+      "source": "client_monotonic_receive",
+      "measurement_origin": {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration"
+      },
+      "ttft_ms": 0.416,
+      "ttfp_ms": 0.244,
+      "rtf": 0.690613,
+      "audio_generation_ms": 2016.591,
+      "audio_duration_ms": 2920.0,
+      "stage0_tokens": {
+        "source": "engine_stage_metrics",
+        "output_token_count": 11,
+        "ttft_ms": 55.3441047668457,
+        "tpot_ms": 7.974618347361684,
+        "itls_ms": [
+          9.9870590493083,
+          6.896961014717817,
+          6.64544990286231,
+          9.886575862765312,
+          9.863561950623989,
+          6.827480159699917,
+          6.858021952211857,
+          6.831836886703968
+        ],
+        "inter_token_interval_ms": {
+          "count": 8,
+          "mean": 7.975,
+          "p50": 6.858,
+          "p95": 9.987,
+          "max": 9.987
+        }
+      }
+    },
+    {
+      "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+      "request_index": 7,
+      "response_id": "resp-omniinteract:1q1a:bench-5b610dd7-3:2766875759285887-0-be1daf88",
+      "source": "client_monotonic_receive",
+      "measurement_origin": {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration"
+      },
+      "ttft_ms": 0.326,
+      "ttfp_ms": 0.217,
+      "rtf": 0.787388,
+      "audio_generation_ms": 3023.57,
+      "audio_duration_ms": 3840.0,
+      "stage0_tokens": {
+        "source": "engine_stage_metrics",
+        "output_token_count": 17,
+        "ttft_ms": 57.34539031982422,
+        "tpot_ms": 8.349210382080996,
+        "itls_ms": [
+          10.103920008987188,
+          6.943688262254,
+          6.944235879927874,
+          9.918912779539824,
+          9.945148136466742,
+          9.847105015069246,
+          6.841396912932396,
+          6.937294267117977,
+          10.219105053693056,
+          10.067889001220465,
+          6.787689868360758,
+          6.79307896643877,
+          7.1902708150446415
+        ],
+        "inter_token_interval_ms": {
+          "count": 13,
+          "mean": 8.349,
+          "p50": 7.19,
+          "p95": 10.219,
+          "max": 10.219
+        }
+      }
+    },
+    {
+      "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+      "request_index": 8,
+      "response_id": "resp-omniinteract:1q1a:bench-5b610dd7-3:2766875759285887-0-2e259703",
+      "source": "client_monotonic_receive",
+      "measurement_origin": {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration"
+      },
+      "ttft_ms": 0.341,
+      "ttfp_ms": 0.215,
+      "rtf": 0.637029,
+      "audio_generation_ms": 1962.048,
+      "audio_duration_ms": 3080.0,
+      "stage0_tokens": {
+        "source": "engine_stage_metrics",
+        "output_token_count": 13,
+        "ttft_ms": 54.231882095336914,
+        "tpot_ms": 8.164793020114303,
+        "itls_ms": [
+          7.269294932484627,
+          7.312255911529064,
+          7.0928237400949,
+          10.782181750983,
+          11.031772010028362,
+          9.819597005844116,
+          6.908148061484098,
+          7.009201217442751,
+          7.28687085211277
+        ],
+        "inter_token_interval_ms": {
+          "count": 9,
+          "mean": 8.279,
+          "p50": 7.287,
+          "p95": 11.032,
+          "max": 11.032
+        }
+      }
+    },
+    {
+      "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+      "request_index": 9,
+      "response_id": "resp-omniinteract:1q1a:bench-5b610dd7-3:2766875759285887-0-eee4a2b2",
+      "source": "client_monotonic_receive",
+      "measurement_origin": {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration"
+      },
+      "ttft_ms": 0.274,
+      "ttfp_ms": 0.177,
+      "rtf": 0.889755,
+      "audio_generation_ms": 2847.216,
+      "audio_duration_ms": 3200.0,
+      "stage0_tokens": {
+        "source": "engine_stage_metrics",
+        "output_token_count": 17,
+        "ttft_ms": 54.10575866699219,
+        "tpot_ms": 7.847977443956411,
+        "itls_ms": [
+          7.080579176545143,
+          7.116150110960007,
+          7.345666643232107,
+          7.115758024156094,
+          11.042472906410694,
+          7.044115103781223,
+          8.204455021768808,
+          10.988828726112843,
+          7.097563240677118,
+          7.211427669972181,
+          7.050570100545883
+        ],
+        "inter_token_interval_ms": {
+          "count": 11,
+          "mean": 7.936,
+          "p50": 7.116,
+          "p95": 11.042,
+          "max": 11.042
+        }
+      }
+    },
+    {
+      "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+      "request_index": 10,
+      "response_id": "resp-omniinteract:1q1a:bench-5b610dd7-3:2766875759285887-0-0ff301b5",
+      "source": "client_monotonic_receive",
+      "measurement_origin": {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration"
+      },
+      "ttft_ms": 0.195,
+      "ttfp_ms": 0.139,
+      "rtf": 1.148436,
+      "audio_generation_ms": 2939.996,
+      "audio_duration_ms": 2560.0,
+      "stage0_tokens": {
+        "source": "engine_stage_metrics",
+        "output_token_count": 16,
+        "ttft_ms": 57.68871307373047,
+        "tpot_ms": 8.43594157292197,
+        "itls_ms": [
+          7.137957029044628,
+          7.615359034389257,
+          10.168707929551601,
+          10.491583030670881,
+          10.113195050507784,
+          6.906801834702492,
+          6.831848062574863,
+          10.44247392565012,
+          10.493298061192036,
+          6.724703125655651,
+          6.909830030053854,
+          7.39554176107049
+        ],
+        "inter_token_interval_ms": {
+          "count": 12,
+          "mean": 8.436,
+          "p50": 7.396,
+          "p95": 10.493,
+          "max": 10.493
+        }
+      }
+    },
+    {
+      "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+      "request_index": 11,
+      "response_id": "resp-omniinteract:1q1a:bench-5b610dd7-3:2766875759285887-0-da553687",
+      "source": "client_monotonic_receive",
+      "measurement_origin": {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration"
+      },
+      "ttft_ms": 0.343,
+      "ttfp_ms": 0.223,
+      "rtf": 0.082332,
+      "audio_generation_ms": 102.092,
+      "audio_duration_ms": 1240.0,
+      "stage0_tokens": {
+        "source": "engine_stage_metrics",
+        "output_token_count": 5,
+        "ttft_ms": 56.63919448852539,
+        "tpot_ms": 9.598457254469395,
+        "itls_ms": [
+          10.632066987454891,
+          10.479224380105734,
+          10.345304850488901,
+          6.9372327998280525
+        ],
+        "inter_token_interval_ms": {
+          "count": 4,
+          "mean": 9.598,
+          "p50": 10.345,
+          "p95": 10.632,
+          "max": 10.632
+        }
+      }
+    },
+    {
+      "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+      "request_index": 12,
+      "response_id": "resp-omniinteract:1q1a:bench-5b610dd7-3:2766875759285887-0-42adc6bb",
+      "source": "client_monotonic_receive",
+      "measurement_origin": {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration"
+      },
+      "ttft_ms": 0.204,
+      "ttfp_ms": 0.14,
+      "rtf": 0.828923,
+      "audio_generation_ms": 2950.966,
+      "audio_duration_ms": 3560.0,
+      "stage0_tokens": {
+        "source": "engine_stage_metrics",
+        "output_token_count": 15,
+        "ttft_ms": 59.128761291503906,
+        "tpot_ms": 8.519053247503258,
+        "itls_ms": [
+          7.3676989413797855,
+          7.100643124431372,
+          10.724158957600594,
+          7.0684743113815784,
+          7.076167967170477,
+          10.457662865519524,
+          11.955914087593555,
+          10.416357778012753,
+          7.081050891429186,
+          7.080174051225185,
+          7.38128274679184
+        ],
+        "inter_token_interval_ms": {
+          "count": 11,
+          "mean": 8.519,
+          "p50": 7.368,
+          "p95": 11.956,
+          "max": 11.956
+        }
+      }
+    },
+    {
+      "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+      "request_index": 13,
+      "response_id": "resp-omniinteract:1q1a:bench-5b610dd7-3:2766875759285887-0-0ec92bd7",
+      "source": "client_monotonic_receive",
+      "measurement_origin": {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration"
+      },
+      "ttft_ms": 0.137,
+      "ttfp_ms": 0.104,
+      "rtf": 0.927702,
+      "audio_generation_ms": 3005.754,
+      "audio_duration_ms": 3240.0,
+      "stage0_tokens": {
+        "source": "engine_stage_metrics",
+        "output_token_count": 16,
+        "ttft_ms": 61.591148376464844,
+        "tpot_ms": 8.986234975357851,
+        "itls_ms": [
+          7.685151882469654,
+          7.727030199021101,
+          7.474170066416264,
+          7.417409680783749,
+          10.867832694202662,
+          10.624959133565426,
+          10.575899854302406,
+          11.812197975814342,
+          11.773297097533941,
+          7.0662652142345905,
+          7.494539953768253,
+          7.316065952181816
+        ],
+        "inter_token_interval_ms": {
+          "count": 12,
+          "mean": 8.986,
+          "p50": 7.685,
+          "p95": 11.812,
+          "max": 11.812
+        }
+      }
+    },
+    {
+      "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+      "request_index": 14,
+      "response_id": "resp-omniinteract:1q1a:bench-5b610dd7-3:2766875759285887-0-7b103a3b",
+      "source": "client_monotonic_receive",
+      "measurement_origin": {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration"
+      },
+      "ttft_ms": 0.269,
+      "ttfp_ms": 0.169,
+      "rtf": 0.982643,
+      "audio_generation_ms": 5935.166,
+      "audio_duration_ms": 6040.0,
+      "stage0_tokens": {
+        "source": "engine_stage_metrics",
+        "output_token_count": 35,
+        "ttft_ms": 58.432817459106445,
+        "tpot_ms": 8.687823143755567,
+        "itls_ms": [
+          7.331088185310364,
+          7.513496093451977,
+          7.05266697332263,
+          7.890533190220594,
+          10.52127592265606,
+          10.53755497559905,
+          7.4967751279473305,
+          7.263475097715855,
+          11.60407904535532,
+          11.198549997061491,
+          7.611493114382029,
+          7.390138693153858,
+          10.875677224248648,
+          10.66401181742549,
+          10.468516033142805,
+          10.570356156677008,
+          7.017448078840971,
+          7.09465192630887,
+          10.445514228194952,
+          10.524315759539604,
+          10.47622412443161,
+          10.236306115984917,
+          7.000758778303862,
+          7.047677878290415,
+          7.107204291969538,
+          7.024156861007214
+        ],
+        "inter_token_interval_ms": {
+          "count": 26,
+          "mean": 8.845,
+          "p50": 7.611,
+          "p95": 11.199,
+          "max": 11.604
+        }
+      }
+    }
+  ],
+  "duplex_session_metrics": {
+    "session_id": "omniinteract:1q1a:bench-5b610dd7-3:2766875759285887",
+    "audio_turn_count": 15,
+    "mean_ttft_ms": 0.288,
+    "mean_ttfp_ms": 0.186,
+    "mean_rtf": 0.781332
+  },
+  "annotation": "/mnt/models_2296/OmniInteract/data/1q1a/annotations/0004.json",
+  "scene_type": "nested"
+}
