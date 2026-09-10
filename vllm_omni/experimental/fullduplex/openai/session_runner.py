@@ -1889,14 +1889,24 @@ class DuplexSessionRunnerMixin:
                                 )
                             continue
                     if self._uses_native_input_append(session) and event_type == "response.create":
+                        # The preceding audio commit waits for the append tail,
+                        # but its done callback may not have removed the task
+                        # from the actor registry yet. Do not drop an explicit
+                        # response.create during that callback window.
+                        await wait_for_native_append_tail()
+                        pending_native_append_tasks = {
+                            task: meta
+                            for task, meta in actor.native_append_tasks.items()
+                            if not task.done()
+                        }
                         if (
                             native_response_in_progress()
-                            or actor.native_append_tasks
+                            or pending_native_append_tasks
                             or native.data_plane_task is not None
                         ):
                             if session.active_response_id is None and (
                                 session.active_request_id is not None
-                                or actor.native_append_tasks
+                                or pending_native_append_tasks
                                 or native.data_plane_task is not None
                             ):
                                 continue
@@ -1913,6 +1923,7 @@ class DuplexSessionRunnerMixin:
                             continue
                         if native.committed_audio_payload is not None:
                             committed_payload = native.committed_audio_payload
+                            committed_payload["duplex_turn_id"] = session.turn_id
                             operation_id = native.committed_audio_operation_id
                             if operation_id is None:
                                 operation_id = uuid.uuid4().hex
@@ -1920,6 +1931,9 @@ class DuplexSessionRunnerMixin:
                             await start_native_append(
                                 committed_payload,
                                 final=True,
+                                # Keep an active response id so explicit
+                                # response.create can continue across native
+                                # listen/TTS segment boundaries.
                                 precreate_response=True,
                                 operation_id=operation_id,
                                 retained_committed_payload=committed_payload,

@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import soundfile as sf
 import torch
 import torch.nn as nn
 
@@ -825,6 +826,8 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
         {
             "duplex_epoch": 3,
             "duplex_turn_id": 7,
+            "source_input_seq": 11,
+            "source_audio_end_ms": 11000,
             "llm_output_text_utf8": segment_text_utf8,
             "tts_is_last_chunk": True,
             "turn_end": False,
@@ -850,6 +853,8 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     assert "meta" not in payload
     assert payload["meta.duplex_epoch"][0].item() == 3
     assert payload["meta.duplex_turn_id"][0].item() == 7
+    assert payload["meta.source_input_seq"][0].item() == 11
+    assert payload["meta.source_audio_end_ms"][0].item() == 11000
     torch.testing.assert_close(
         payload["meta.llm_output_text_utf8"][0],
         segment_text_utf8,
@@ -964,6 +969,23 @@ def test_runtime_prompt_write_failure_does_not_publish_partial_file(tmp_path, mo
     entry = next(iter(model._runtime_prompts.values()))
     assert not Path(entry.path).exists()
     assert list(Path(entry.path).parent.iterdir()) == []
+
+
+def test_prewarm_runtime_prompt_trims_to_complete_audio_tokens(tmp_path):
+    model, _ = _model()
+    source = tmp_path / "reference.wav"
+    sf.write(source, torch.zeros(1600 * 3 + 123).numpy(), 16000, format="WAV")
+    model._prompt_wav_override = str(source)
+
+    cache_id, prompt_wav, temporary = model._prewarm_runtime_prompt()
+
+    assert cache_id.endswith("-runtime-prewarm")
+    assert temporary is True
+    _, sample_rate = sf.read(prompt_wav, dtype="float32")
+    info = sf.info(prompt_wav)
+    assert sample_rate == 16000
+    assert info.frames == 1600 * 3
+    Path(prompt_wav).unlink()
 
 
 def test_runtime_prompt_files_are_isolated_between_model_instances(tmp_path, monkeypatch):
@@ -1121,6 +1143,19 @@ def test_non_final_chunk_shorter_than_lookahead_window_is_rejected():
     # The final chunk is zero-padded by the encoder, so it stays decodable.
     audios, _ = adapter.decode_batch(torch.tensor([[10]]), prompt, states, last_chunk=True)
     assert len(audios) == 1
+
+
+def test_cuda_graph_prewarm_is_a_noop_on_cpu():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+
+    result = adapter.prewarm_cuda_graphs(
+        prompt,
+        batch_sizes=[1],
+        codec_frame_sizes=[25],
+    )
+
+    assert result == {"hift_graphs": 0, "cfm_graphs": 0}
 
 
 def test_forward_builds_backend_when_weight_loading_was_skipped(monkeypatch):

@@ -380,6 +380,17 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         )
         update_result = dict(result)
         update_result.pop("inputs_embeds", None)
+        if seq is not None:
+            update_result["source_input_seq"] = seq
+        # Clear the client media-clock attribution on model-generated silence
+        # continuations instead of retaining the previous real audio append.
+        update_result["source_audio_end_ms"] = -1
+        source_audio_end_ms = payload.get("audio_end_ms")
+        if isinstance(source_audio_end_ms, int | float) and not isinstance(
+            source_audio_end_ms,
+            bool,
+        ):
+            update_result["source_audio_end_ms"] = int(source_audio_end_ms)
         if result.get("success") is not True:
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {"duplex": update_result}
@@ -607,6 +618,24 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                         ]
                         for key in sorted(special_keys)
                     }
+                for source_key in ("source_input_seq", "source_audio_end_ms"):
+                    source_values = [duplex_info.get(source_key) for duplex_info in duplex_rows]
+                    if not any(
+                        isinstance(value, int) and not isinstance(value, bool)
+                        for value in source_values
+                    ):
+                        continue
+                    meta_outputs = multimodal_outputs.setdefault("meta", {})
+                    meta_outputs[source_key] = [
+                        torch.tensor(
+                            [int(value)],
+                            dtype=torch.long,
+                            device=text_hidden_states.device,
+                        )
+                        if isinstance(value, int) and not isinstance(value, bool)
+                        else None
+                        for value in source_values
+                    ]
             return OmniOutput(
                 text_hidden_states=text_hidden_states,
                 multimodal_outputs=multimodal_outputs,

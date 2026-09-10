@@ -810,7 +810,7 @@ class NativeRuntimeBridgeMixin:
             if (
                 self._data_plane_outputs_finished(drain_result)
                 and emitted_response
-                and not self._session_auto_responds(session)
+                and session.active_response_id is None
             ):
                 # Auto-respond sessions are resumable: every segment ends
                 # with finished=True but the stream continues with the next
@@ -958,14 +958,13 @@ class NativeRuntimeBridgeMixin:
             auto_continuations_remaining = active_response_id is None or self._native_response_continuations_remaining(
                 session, active_response_id
             )
-            non_terminal_auto_listen = (
-                auto_response
-                and active_response_id is not None
+            non_terminal_listen = (
+                active_response_id is not None
                 and session.active_request_id is not None
                 and native_result.get("end_of_turn") is not True
                 and auto_continuations_remaining
             )
-            if non_terminal_auto_listen:
+            if non_terminal_listen:
                 await self._maybe_continue_native_response(
                     send_json,
                     session=session,
@@ -1042,11 +1041,7 @@ class NativeRuntimeBridgeMixin:
             tts_segment_ended = (
                 native_result.get("stage_role") == "tts" and native_result.get("abort_data_plane_request") is True
             )
-            if (
-                tts_segment_ended
-                and self._session_auto_responds(session)
-                and (model_turn_id is not None or session.active_response_id is not None)
-            ):
+            if tts_segment_ended and (model_turn_id is not None or session.active_response_id is not None):
                 await self._maybe_continue_native_response(
                     send_json,
                     session=session,
@@ -1199,7 +1194,7 @@ class NativeRuntimeBridgeMixin:
             not end_of_turn
             and native_result.get("stage_role") == "tts"
             and native_result.get("abort_data_plane_request") is True
-            and self._session_auto_responds(session)
+            and session.active_response_id is not None
         ):
             await self._maybe_continue_native_response(
                 send_json,
@@ -1360,6 +1355,10 @@ class NativeRuntimeBridgeMixin:
         model_turn_id = coerce_int(native_result.get("model_turn_id"))
         if model_turn_id is not None:
             metadata["model_turn_id"] = model_turn_id
+        for name in ("source_input_seq", "source_audio_end_ms"):
+            value = coerce_int(native_result.get(name))
+            if value is not None:
+                metadata[name] = value
         for name in (
             "uses_model_runner_scheduler",
             "runner_kv_backed",

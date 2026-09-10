@@ -34,6 +34,8 @@ class _MiniCPMO45MetaStruct(MetaStruct):
     llm_output_text_utf8: torch.Tensor | None = None
     duplex_turn_id: int | None = None
     duplex_epoch: int | None = None
+    source_input_seq: int | None = None
+    source_audio_end_ms: int | None = None
     segment_end: bool | None = None
     turn_end: bool | None = None
     tts_is_last_chunk: bool | None = None
@@ -144,6 +146,20 @@ def _coerce_int(value):
         return None
 
 
+def _metadata_int(metadata: object, name: str) -> int | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    meta = metadata.get("meta")
+    candidates = [metadata.get(name), metadata.get(f"meta.{name}")]
+    if isinstance(meta, Mapping):
+        candidates.append(meta.get(name))
+    for value in candidates:
+        result = _coerce_int(value)
+        if result is not None:
+            return result
+    return None
+
+
 def _codec_config(transfer_manager: Any) -> tuple[int, int]:
     connector = getattr(transfer_manager, "connector", None)
     raw_config = getattr(connector, "config", {}) or {}
@@ -249,6 +265,8 @@ def tts2code2wav_async_chunk(
     native_duplex = bool(_coerce_int(output_meta.get("native_duplex")))
     duplex_epoch = _coerce_int(output_meta.get("duplex_epoch"))
     duplex_turn_id = _coerce_int(output_meta.get("duplex_turn_id"))
+    source_input_seq = _metadata_int(multimodal_output, "source_input_seq")
+    source_audio_end_ms = _metadata_int(multimodal_output, "source_audio_end_ms")
     segment_text_utf8 = output_meta.get("llm_output_text_utf8")
     if not isinstance(segment_text_utf8, torch.Tensor):
         segment_text_utf8 = None
@@ -406,6 +424,8 @@ def tts2code2wav_async_chunk(
             req_id=[request_id],
             duplex_epoch=duplex_epoch,
             duplex_turn_id=duplex_turn_id,
+            source_input_seq=source_input_seq,
+            source_audio_end_ms=source_audio_end_ms,
             llm_output_text_utf8=segment_text_utf8,
             tts_is_last_chunk=flush_pending,
             turn_end=turn_end and last_chunk,
@@ -698,6 +718,10 @@ def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] |
     turn_id = duplex_state.get("model_turn_id", duplex_state.get("turn_id"))
     if isinstance(turn_id, int):
         metadata["turn_id"] = turn_id
+    for key in ("source_input_seq", "source_audio_end_ms"):
+        value = duplex_state.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            metadata[key] = value
     session_config = duplex_state.get("session_config")
     if isinstance(session_config, dict):
         metadata["session_config"] = dict(session_config)
@@ -966,6 +990,10 @@ def llm2tts(
             meta = model_intermediate_buffer.setdefault("meta", {})
             data_plane_metadata = _native_duplex_data_plane_metadata(_streaming_context)
             if data_plane_metadata is not None:
+                for key in ("source_input_seq", "source_audio_end_ms"):
+                    value = _metadata_int(mm_output, key)
+                    if value is not None:
+                        data_plane_metadata[key] = value
                 model_intermediate_buffer["duplex"] = data_plane_metadata
             meta["native_duplex_segment_text"] = thinker_text
             meta.setdefault("override_keys", []).extend(

@@ -1,0 +1,31 @@
+# Every H200 hosts one replica of Thinker, Talker, and Code2Wav (8:8:8).
+base_config: base_h200_b32_fullgraph256.yaml
+
+active_stream_window: 64
+duplex_session:
+  max_sessions: 64
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3,4,5,6,7"
+    num_replicas: 8
+    max_num_seqs: 8
+    max_num_batched_tokens: 8192
+    gpu_memory_utilization: 0.50
+
+  - stage_id: 1
+    devices: "0,1,2,3,4,5,6,7"
+    num_replicas: 8
+    max_num_seqs: 8
+    max_num_batched_tokens: 2048
+    max_model_len: 4096
+    gpu_memory_utilization: 0.15
+
+  - stage_id: 2
+    devices: "0,1,2,3,4,5,6,7"
+    num_replicas: 8
+    max_num_seqs: 8
+    max_num_batched_tokens: 16384
+    max_model_len: 16384
+    gpu_memory_utilization: 0.20
+

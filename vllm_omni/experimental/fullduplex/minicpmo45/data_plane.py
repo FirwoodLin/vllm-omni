@@ -133,9 +133,15 @@ class MiniCPMO45DataPlaneSession:
     ) -> Iterator[dict[str, object]]:
         context = context or MiniCPMO45DataPlaneContext()
         stage_metrics = _output_stage_metrics(output)
+        source_input_seq: int | None = None
+        source_audio_end_ms: int | None = None
 
         def runtime_result(**values: object) -> dict[str, object]:
             result = _runtime_result(**values)
+            if source_input_seq is not None:
+                result["source_input_seq"] = source_input_seq
+            if source_audio_end_ms is not None:
+                result["source_audio_end_ms"] = source_audio_end_ms
             if stage_metrics is not None:
                 result["stage_metrics"] = stage_metrics
             return result
@@ -174,6 +180,8 @@ class MiniCPMO45DataPlaneSession:
                     if isinstance(inner_mm_output, Mapping):
                         mm_output = inner_mm_output
         mm_output = dict(mm_output) if isinstance(mm_output, Mapping) else {}
+        source_input_seq = _first_metadata_int(mm_output, "source_input_seq")
+        source_audio_end_ms = _first_metadata_int(mm_output, "source_audio_end_ms")
 
         output_turn_id = output_turn_id_from_metadata(mm_output)
         output_epoch = output_epoch_from_metadata(mm_output)

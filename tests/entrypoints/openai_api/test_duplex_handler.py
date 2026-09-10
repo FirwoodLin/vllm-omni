@@ -2489,10 +2489,21 @@ def test_duplex_listen_latent_does_not_poison_cumulative_audio_offset():
 
 
 def test_direct_listen_decision_survives_inner_completion_metadata():
+    decision_metadata = {
+        "special_token_ids": {"listen_token_id": 151705},
+        "source_input_seq": 7,
+        "source_audio_end_ms": 7000,
+    }
     inner_output = SimpleNamespace(
         outputs=[
             SimpleNamespace(
-                multimodal_output={"special_token_ids": {"listen_token_id": 151705}},
+                multimodal_output={
+                    "special_token_ids": {"listen_token_id": 151705},
+                    "meta": {
+                        "source_input_seq": 7,
+                        "source_audio_end_ms": 7000,
+                    },
+                },
             )
         ]
     )
@@ -2501,7 +2512,7 @@ def test_direct_listen_decision_survives_inner_completion_metadata():
         final_stage_id=1,
         segment_finished=True,
         segment_token_ids=(151705,),
-        segment_output_metadata={"special_token_ids": {"listen_token_id": 151705}},
+        segment_output_metadata=decision_metadata,
         output=inner_output,
     )
     assert decision is not None
@@ -2532,6 +2543,8 @@ def test_direct_listen_decision_survives_inner_completion_metadata():
     assert results[0]["is_listen"] is True
     assert results[0]["model_listen"] is True
     assert results[0]["listen_source"] == "model_listen"
+    assert results[0]["source_input_seq"] == 7
+    assert results[0]["source_audio_end_ms"] == 7000
     assert results[0]["stage_metrics"] == output.metrics["stage_metrics"]
 
 
@@ -3122,7 +3135,9 @@ async def test_native_append_propagates_current_turn_fence_to_engine():
 
 
 @pytest.mark.asyncio
-async def test_minicpmo_auto_response_tts_segment_boundary_appends_silence_unit():
+@pytest.mark.parametrize("auto_response", [False, True])
+@pytest.mark.parametrize("audio_data", ["", "audio-chunk"])
+async def test_minicpmo_response_tts_segment_boundary_appends_silence_unit(auto_response, audio_data):
     request_id = "duplex-sid-segment-boundary-e0-stage0"
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(
@@ -3132,7 +3147,7 @@ async def test_minicpmo_auto_response_tts_segment_boundary_appends_silence_unit(
     )
     session = DuplexSession(
         session_id="sid-segment-boundary",
-        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+        config=DuplexSessionConfig(extra_body={"auto_response": auto_response}),
     )
     session.capabilities = DuplexCapabilities.minicpmo45_native()
     session.begin_response(turn_id=0)
@@ -3150,7 +3165,7 @@ async def test_minicpmo_auto_response_tts_segment_boundary_appends_silence_unit(
             "is_listen": False,
             "data_plane_request_id": request_id,
             "text": "",
-            "audio_data": "",
+            "audio_data": audio_data,
             "audio_format": "pcm16",
             "end_of_turn": False,
             "abort_data_plane_request": True,
@@ -3347,6 +3362,8 @@ async def test_minicpmo_auto_response_boundary_listen_closes_response():
             "uses_model_runner_scheduler": True,
             "runner_kv_backed": True,
             "runtime_impl": "scheduler_data_plane",
+            "source_input_seq": 7,
+            "source_audio_end_ms": 7000,
         },
         session=session,
         expected_epoch=session.epoch,
@@ -3356,6 +3373,8 @@ async def test_minicpmo_auto_response_boundary_listen_closes_response():
     assert emitted is True
     assert engine.appended == []
     assert ws.sent_types() == ["response.listen", "response.done"]
+    assert ws.sent[0]["vllm_omni"]["source_input_seq"] == 7
+    assert ws.sent[0]["vllm_omni"]["source_audio_end_ms"] == 7000
     assert session.active_response_id is None
     assert session.active_request_id == request_id
     assert session.turn_id == 1
@@ -3453,13 +3472,14 @@ async def test_minicpmo_auto_response_boundary_does_not_close_new_epoch_response
 
 
 @pytest.mark.asyncio
-async def test_minicpmo_auto_response_pre_speak_listen_continues_same_response():
+@pytest.mark.parametrize("auto_response", [False, True])
+async def test_minicpmo_response_pre_speak_listen_continues_same_response(auto_response):
     request_id = "duplex-sid-pre-speak-listen-e0-stage0"
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
     session = DuplexSession(
         session_id="sid-pre-speak-listen",
-        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+        config=DuplexSessionConfig(extra_body={"auto_response": auto_response}),
     )
     session.capabilities = DuplexCapabilities.minicpmo45_native()
     response_id = session.begin_response(turn_id=0)

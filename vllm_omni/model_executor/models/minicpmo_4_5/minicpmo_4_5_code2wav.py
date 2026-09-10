@@ -30,6 +30,11 @@ from .batched_token2wav import (
 
 logger = init_logger(__name__)
 
+# Native-duplex reference audio is trimmed to complete 100 ms pooled tokens
+# before it reaches Code2Wav (16 kHz * 100 ms).  Keep the prewarm path on the
+# same boundary so its prompt mel length matches runtime CFM cache keys.
+_RUNTIME_PROMPT_SAMPLES_PER_TOKEN = 1600
+
 
 def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
     """Resolve ``model_ref`` to a local directory containing the repo assets.
@@ -128,6 +133,8 @@ class _WorkItem:
     runtime_prompt_key: str | None
     duplex_epoch: int
     duplex_turn_id: int
+    source_input_seq: int
+    source_audio_end_ms: int
     segment_text_utf8: torch.Tensor
     tts_is_last_chunk: bool
     segment_end: bool
@@ -174,15 +181,35 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
         raw_capture_batch_sizes = extra.get("hift_graph_capture_batch_sizes")
         capture_batch_sizes = [1] if raw_capture_batch_sizes is None else raw_capture_batch_sizes
+        disable_lazy_capture = bool(extra.get("disable_cudagraph_lazy_capture", False))
         self._hift_graph_config = {
             "enabled": bool(extra.get("enable_hift_graph", False)),
             "capture_batch_sizes": capture_batch_sizes,
             "max_lazy_graphs": int(extra.get("hift_graph_max_lazy_graphs", 8)),
+            "allow_lazy_capture": bool(
+                extra.get("hift_graph_allow_lazy_capture", not disable_lazy_capture)
+            ),
         }
         self._cfm_graph_config = {
             "enabled": bool(extra.get("enable_cfm_graph", False)),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
+            "allow_lazy_capture": bool(
+                extra.get("cfm_graph_allow_lazy_capture", not disable_lazy_capture)
+            ),
         }
+        self._cudagraph_prewarm = bool(extra.get("prewarm_cudagraphs", False))
+        raw_prewarm_batches = extra.get("cudagraph_prewarm_batch_sizes", capture_batch_sizes)
+        self._cudagraph_prewarm_batch_sizes = list(raw_prewarm_batches)
+        raw_prewarm_initial_frames = extra.get("cudagraph_prewarm_initial_frame_sizes", ())
+        self._cudagraph_prewarm_initial_frame_sizes = list(raw_prewarm_initial_frames)
+        raw_prewarm_frames = extra.get(
+            "cudagraph_prewarm_codec_frame_sizes",
+            [self._connector_config["codec_chunk_frames"]],
+        )
+        self._cudagraph_prewarm_codec_frame_sizes = list(raw_prewarm_frames)
+        raw_prewarm_final_frames = extra.get("cudagraph_prewarm_final_frame_sizes", [1])
+        self._cudagraph_prewarm_final_frame_sizes = list(raw_prewarm_final_frames)
+        self._cudagraph_prewarm_steady_repeats = int(extra.get("cudagraph_prewarm_steady_repeats", 3))
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
@@ -381,6 +408,8 @@ class MiniCPMO45Code2Wav(nn.Module):
                 runtime_prompt_key=None,
                 duplex_epoch=-1,
                 duplex_turn_id=-1,
+                source_input_seq=-1,
+                source_audio_end_ms=-1,
                 segment_text_utf8=torch.empty(0, dtype=torch.uint8),
                 tts_is_last_chunk=False,
                 segment_end=False,
@@ -478,6 +507,8 @@ class MiniCPMO45Code2Wav(nn.Module):
             runtime_prompt_key=runtime_prompt_key,
             duplex_epoch=int(_scalar(meta.get("duplex_epoch"), -1)),
             duplex_turn_id=int(_scalar(meta.get("duplex_turn_id"), -1)),
+            source_input_seq=int(_scalar(meta.get("source_input_seq"), -1)),
+            source_audio_end_ms=int(_scalar(meta.get("source_audio_end_ms"), -1)),
             segment_text_utf8=segment_text_utf8,
             tts_is_last_chunk=tts_is_last_chunk,
             segment_end=bool(_scalar(meta.get("segment_end"), False)),
@@ -812,6 +843,12 @@ class MiniCPMO45Code2Wav(nn.Module):
                 # processor before the full-duplex data plane consumes them.
                 "meta.duplex_epoch": [torch.tensor(item.duplex_epoch, dtype=torch.int32) for item in items],
                 "meta.duplex_turn_id": [torch.tensor(item.duplex_turn_id, dtype=torch.int32) for item in items],
+                "meta.source_input_seq": [
+                    torch.tensor(item.source_input_seq, dtype=torch.int32) for item in items
+                ],
+                "meta.source_audio_end_ms": [
+                    torch.tensor(item.source_audio_end_ms, dtype=torch.int32) for item in items
+                ],
                 "meta.llm_output_text_utf8": [item.segment_text_utf8 for item in items],
                 "meta.tts_is_last_chunk": [torch.tensor(item.tts_is_last_chunk, dtype=torch.bool) for item in items],
                 "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
@@ -913,3 +950,71 @@ class MiniCPMO45Code2Wav(nn.Module):
             cfm_graph_config=self._cfm_graph_config,
             bfloat16_attention_cache=bool(extra.get("code2wav_bfloat16_attention_cache", False)),
         )
+        if self._cudagraph_prewarm and current_omni_platform.is_cuda():
+            self._prewarm_cuda_graphs()
+
+    def _prewarm_runtime_prompt(self) -> tuple[str, str, bool]:
+        """Materialize the default prompt exactly like native-duplex requests.
+
+        Native duplex resolves the reference audio to float32, normalizes it to
+        mono/16 kHz, trims it to complete 100 ms pooled tokens, and writes a
+        temporary WAV before Code2Wav prepares the prompt.  Reading the model
+        asset directly can therefore produce a different mel length (302
+        versus 300 in the HumDial run), which makes every CFM cache key miss.
+        Return a temporary canonical WAV when the transformation is available;
+        otherwise retain the configured prompt.
+        """
+        prompt_path = Path(self._default_prompt_wav)
+        try:
+            waveform, sample_rate = sf.read(prompt_path, dtype="float32", always_2d=False)
+            if getattr(waveform, "ndim", 1) > 1:
+                waveform = waveform.mean(axis=-1)
+            sample_rate = int(sample_rate)
+            if sample_rate != 16_000:
+                import torchaudio
+
+                waveform = torchaudio.functional.resample(
+                    torch.from_numpy(waveform), sample_rate, 16_000
+                ).numpy()
+                sample_rate = 16_000
+            usable = (len(waveform) // _RUNTIME_PROMPT_SAMPLES_PER_TOKEN) * (
+                _RUNTIME_PROMPT_SAMPLES_PER_TOKEN
+            )
+            waveform = waveform[:usable]
+            canonical_path = Path(self._runtime_prompt_dir.name) / "prewarm_default_runtime.wav"
+            sf.write(canonical_path, waveform, sample_rate, format="WAV")
+        except Exception:
+            logger.exception(
+                "MiniCPM-o could not canonicalize the default prompt for CUDA Graph prewarm; "
+                "using the configured prompt path"
+            )
+            return self._default_prompt_id, self._default_prompt_wav, False
+        return f"{self._default_prompt_id}-runtime-prewarm", str(canonical_path), True
+
+    def _prewarm_cuda_graphs(self) -> None:
+        """Warm trace-guided Code2Wav CUDA-Graph shapes before serving requests."""
+        if self.backend is None:
+            return
+        prompt_cache_id, prompt_wav, temporary_prompt = self._prewarm_runtime_prompt()
+        try:
+            features = self.backend.prepare_prompt(
+                prompt_cache_id,
+                prompt_wav,
+            )
+            self.backend.prewarm_cuda_graphs(
+                features,
+                batch_sizes=self._cudagraph_prewarm_batch_sizes,
+                initial_frame_sizes=self._cudagraph_prewarm_initial_frame_sizes,
+                codec_frame_sizes=self._cudagraph_prewarm_codec_frame_sizes,
+                final_frame_sizes=self._cudagraph_prewarm_final_frame_sizes,
+                steady_repeats=self._cudagraph_prewarm_steady_repeats,
+            )
+        except Exception:
+            # Prewarm is an optimization and must not make the serving worker
+            # unavailable.  The graph wrappers retain their configured eager
+            # fallback policy for any shape that could not be captured.
+            logger.exception("MiniCPM-o CUDA Graph prewarm failed; serving will continue")
+        finally:
+            self.backend.evict_prompt(prompt_cache_id, prompt_wav)
+            if temporary_prompt:
+                Path(prompt_wav).unlink(missing_ok=True)

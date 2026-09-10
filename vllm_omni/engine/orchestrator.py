@@ -1150,11 +1150,19 @@ class Orchestrator:
             iteration_stats=iteration_stats,
         )
         if self._stat_logger is not None and (raw_outputs.scheduler_stats is not None or iteration_stats is not None):
-            self._stat_logger.record(
-                raw_outputs.scheduler_stats,
-                iteration_stats,
-                engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
-            )
+            # Headless replicas may be attached dynamically after the
+            # orchestrator has constructed its static metrics index map. They
+            # still participate in request routing, but do not yet have a
+            # pre-created Prometheus engine label. Skip only that optional
+            # metrics record instead of terminating the whole orchestrator on
+            # a KeyError while processing an otherwise valid output.
+            engine_idx = self._stage_replica_to_engine_idx.get((stage_id, replica_id))
+            if engine_idx is not None:
+                self._stat_logger.record(
+                    raw_outputs.scheduler_stats,
+                    iteration_stats,
+                    engine_idx=engine_idx,
+                )
         _sched_stats = raw_outputs.scheduler_stats
         if (
             self._prom_metrics is not None

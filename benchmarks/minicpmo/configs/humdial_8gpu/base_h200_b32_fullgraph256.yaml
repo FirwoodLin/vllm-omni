@@ -1,0 +1,63 @@
+# Shared H200 service baseline for the HumDial MiniCPM-o 4.5 experiments.
+# Physical placement is intentionally supplied by one of the topology overlays.
+base_config: ../../../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml
+
+pipeline: minicpmo_4_5
+session_mode: duplex
+active_stream_window: 32
+
+duplex_session:
+  idle_ttl_s: 300
+  disconnect_grace_s: 30
+  reaper_interval_s: 5
+  max_sessions: 32
+  max_pending_input_bytes_per_session: 16777216
+  max_pending_turns_per_session: 4
+  completed_append_cache_size: 1024
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+      enable_hift_graph: true
+      hift_graph_capture_batch_sizes: [1, 2, 4, 8, 16, 24, 32]
+      hift_graph_max_lazy_graphs: 128
+      enable_cfm_graph: true
+      cfm_max_graphs: 256
+      # Trace-guided census from the real humdial_900 run.  The native-duplex
+      # stream carries 25 new codec frames plus 3 left-context frames, hence
+      # the observed total input width of 28.  The initial/final residuals are
+      # kept because they are on the first-packet/playback-critical path.
+      prewarm_cudagraphs: true
+      cudagraph_prewarm_batch_sizes: [1]
+      cudagraph_prewarm_initial_frame_sizes: [9, 10, 13, 18, 23, 27]
+      cudagraph_prewarm_codec_frame_sizes: [28]
+      cudagraph_prewarm_final_frame_sizes: [6, 9, 12, 19, 22, 28]
+      cudagraph_prewarm_steady_repeats: 3
+      disable_cudagraph_lazy_capture: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 32
+    async_scheduling: false
+    max_num_batched_tokens: 32768
+
+  - stage_id: 1
+    max_num_seqs: 32
+    async_scheduling: false
+    max_model_len: 4096
+    default_sampling_params:
+      min_tokens: 0
+
+  - stage_id: 2
+    max_num_seqs: 32
+    async_scheduling: false
+    # Code2Wav is a custom codec-to-waveform stage rather than a normal HF
+    # transformer. Its long scheduler/input limit is intentional; Omni sets
+    # VLLM_ALLOW_LONG_MAX_MODEL_LEN for this stage during initialization.
+    max_model_len: 65536

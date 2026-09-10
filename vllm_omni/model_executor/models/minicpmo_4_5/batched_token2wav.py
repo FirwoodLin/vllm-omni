@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, cast
@@ -224,12 +224,17 @@ class BatchedToken2Wav(nn.Module):
                         "MiniCPM-o HiFT CUDA Graph requires source_cache_len to be divisible by mel_cache_len"
                     )
                 capture_batch_sizes = graph_config.get("capture_batch_sizes", [1])
-                logger.info("Enabling HiFT CUDA Graph with batch sizes %s", capture_batch_sizes)
+                logger.info(
+                    "Enabling HiFT CUDA Graph with batch sizes %s (allow_lazy_capture=%s)",
+                    capture_batch_sizes,
+                    bool(graph_config.get("allow_lazy_capture", True)),
+                )
                 self.hift_graph_wrapper = HiFTGraphWrapper(
                     token2wav=token2wav,
                     connector_config=dict(connector_config),
                     capture_batch_sizes=capture_batch_sizes,
                     max_lazy_graphs=int(graph_config.get("max_lazy_graphs", 8)),
+                    allow_lazy_capture=bool(graph_config.get("allow_lazy_capture", True)),
                 )
                 with torch.inference_mode(), _autocast_disabled(hift_parameter.device):
                     self.hift_graph_wrapper.capture()
@@ -243,8 +248,13 @@ class BatchedToken2Wav(nn.Module):
                 self._cfm_graph_wrapper = CFMGraphWrapper(
                     graph_fn=estimator.blocks_forward_chunk,
                     max_graphs=int(cfm_graph_cfg.get("max_graphs", 32)),
+                    allow_lazy_capture=bool(cfm_graph_cfg.get("allow_lazy_capture", True)),
                 )
-                logger.info("CFM CUDA Graph enabled (max_graphs=%d)", int(cfm_graph_cfg.get("max_graphs", 32)))
+                logger.info(
+                    "CFM CUDA Graph enabled (max_graphs=%d, allow_lazy_capture=%s)",
+                    int(cfm_graph_cfg.get("max_graphs", 32)),
+                    bool(cfm_graph_cfg.get("allow_lazy_capture", True)),
+                )
             else:
                 logger.info(
                     "CFM CUDA Graph is disabled on device type %s",
@@ -282,6 +292,163 @@ class BatchedToken2Wav(nn.Module):
             )
             self._prompt_features[cache_key] = cached
         return cached
+
+    def prewarm_cuda_graphs(
+        self,
+        features: PromptFeatures,
+        *,
+        batch_sizes: Sequence[int],
+        initial_frame_sizes: Sequence[int] = (),
+        codec_frame_sizes: Sequence[int],
+        final_frame_sizes: Sequence[int] = (1,),
+        steady_repeats: int = 3,
+    ) -> dict[str, int]:
+        """Capture the common Code2Wav shapes before serving requests.
+
+        CFM graphs are keyed by the complete tensor signature, including the
+        rolling attention-cache width, so there is no finite shape list for
+        arbitrary-length traffic.  This warmup deliberately covers the
+        prompt/setup path, optional first-chunk residuals, one or more full
+        streaming chunks, and short final chunks.  Any shape outside this
+        census can be handled by eager fallback when lazy capture is disabled
+        in the deployment config.
+        """
+        device = features.speech_tokens.device
+        if device.type != "cuda":
+            logger.info("Skipping MiniCPM-o CUDA Graph prewarm on device type %s", device.type)
+            return {"hift_graphs": 0, "cfm_graphs": 0}
+
+        batch_sizes = tuple(sorted({int(size) for size in batch_sizes if int(size) > 0}))
+        initial_frame_sizes = tuple(
+            sorted({int(size) for size in initial_frame_sizes if int(size) > 0})
+        )
+        codec_frame_sizes = tuple(sorted({int(size) for size in codec_frame_sizes if int(size) > 0}))
+        final_frame_sizes = tuple(sorted({int(size) for size in final_frame_sizes if int(size) > 0}))
+        if not batch_sizes or not codec_frame_sizes:
+            raise ValueError("CUDA Graph prewarm requires positive batch and codec frame sizes")
+        steady_repeats = max(1, int(steady_repeats))
+
+        hift_wrapper = self.hift_graph_wrapper
+        cfm_wrapper = self._cfm_graph_wrapper
+        old_hift_lazy = getattr(hift_wrapper, "allow_lazy_capture", True) if hift_wrapper is not None else True
+        old_hift_limit = getattr(hift_wrapper, "max_lazy_graphs", 0) if hift_wrapper is not None else 0
+        old_cfm_lazy = getattr(cfm_wrapper, "allow_lazy_capture", True) if cfm_wrapper is not None else True
+        if hift_wrapper is not None:
+            hift_wrapper.allow_lazy_capture = True
+            # The runtime lazy budget is a serving guard.  Warmup must be able
+            # to admit every requested final/steady shape even when the
+            # deployment intentionally sets that budget to zero.
+            hift_wrapper.max_lazy_graphs = max(old_hift_limit, 4096)
+        if cfm_wrapper is not None:
+            cfm_wrapper.allow_lazy_capture = True
+
+        try:
+            with torch.inference_mode():
+                for batch_size in batch_sizes:
+                    for frame_count in initial_frame_sizes:
+                        states = self.setup_batch(features, batch_size)
+                        tokens = features.speech_tokens.new_full(
+                            (batch_size, frame_count),
+                            _SILENCE_TOKEN,
+                        )
+                        _, states = self.decode_batch(
+                            tokens,
+                            features,
+                            states,
+                            last_chunk=False,
+                        )
+                        # Preserve the rolling-cache state produced by the
+                        # residual first chunk and run the steady trace from
+                        # that state as well as from a fresh setup below.
+                        # Runtime requests commonly start with a residual
+                        # chunk, so their cache widths differ from the
+                        # standalone 300->350->400 path.
+                        for _ in range(steady_repeats):
+                            _, states = self.decode_batch(
+                                tokens.new_full((batch_size, codec_frame_sizes[0]), _SILENCE_TOKEN),
+                                features,
+                                states,
+                                last_chunk=False,
+                            )
+                        if final_frame_sizes:
+                            # Each final shape needs the same post-steady
+                            # cache state.  Clone the state before every
+                            # branch because decode mutates its cache tensors.
+                            for final_count in final_frame_sizes:
+                                final_states = [
+                                    BatchedToken2WavState(
+                                        flow_cache={
+                                            name: value.clone() for name, value in state.flow_cache.items()
+                                        },
+                                        hift_cache={
+                                            name: value.clone() for name, value in state.hift_cache.items()
+                                        },
+                                    )
+                                    for state in states
+                                ]
+                                final_tokens = features.speech_tokens.new_full(
+                                    (batch_size, final_count),
+                                    _SILENCE_TOKEN,
+                                )
+                                self.decode_batch(
+                                    final_tokens,
+                                    features,
+                                    final_states,
+                                    last_chunk=True,
+                                )
+
+                    for frame_count in codec_frame_sizes:
+                        states = self.setup_batch(features, batch_size)
+                        tokens = features.speech_tokens.new_full(
+                            (batch_size, frame_count),
+                            _SILENCE_TOKEN,
+                        )
+                        for _ in range(steady_repeats):
+                            _, states = self.decode_batch(
+                                tokens,
+                                features,
+                                states,
+                                last_chunk=False,
+                            )
+
+                    for frame_count in final_frame_sizes:
+                        states = self.setup_batch(features, batch_size)
+                        tokens = features.speech_tokens.new_full(
+                            (batch_size, frame_count),
+                            _SILENCE_TOKEN,
+                        )
+                        self.decode_batch(
+                            tokens,
+                            features,
+                            states,
+                            last_chunk=True,
+                        )
+            torch.accelerator.synchronize(device)
+        finally:
+            if hift_wrapper is not None:
+                hift_wrapper.allow_lazy_capture = old_hift_lazy
+                hift_wrapper.max_lazy_graphs = old_hift_limit
+            if cfm_wrapper is not None:
+                cfm_wrapper.allow_lazy_capture = old_cfm_lazy
+
+        result = {
+            "hift_graphs": len(hift_wrapper.graph) if hift_wrapper is not None else 0,
+            "cfm_graphs": len(cfm_wrapper._cache) if cfm_wrapper is not None else 0,
+        }
+        logger.info(
+            "MiniCPM-o CUDA Graph prewarm complete: batches=%s codec_frames=%s "
+            "initial_frames=%s final_frames=%s steady_repeats=%d hift_graphs=%d "
+            "cfm_graphs=%d cfm_stats=%s",
+            batch_sizes,
+            codec_frame_sizes,
+            initial_frame_sizes,
+            final_frame_sizes,
+            steady_repeats,
+            result["hift_graphs"],
+            result["cfm_graphs"],
+            cfm_wrapper.stats_snapshot() if cfm_wrapper is not None else {},
+        )
+        return result
 
     def evict_prompt(self, prompt_cache_id: str, prompt_wav: str) -> None:
         """Release request-owned prompt features after stream completion."""

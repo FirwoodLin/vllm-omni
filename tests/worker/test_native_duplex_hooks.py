@@ -483,6 +483,75 @@ def test_minicpmo_model_cleans_incarnation_state_when_request_finishes():
     }
 
 
+def test_minicpmo_stage0_preprocess_attributes_output_to_source_input_unit():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    session_key = ("sid-source", 0)
+    helper = SimpleNamespace(
+        sessions={session_key: object()},
+        _decode_audio_payload=lambda payload: np.zeros(16000, dtype=np.float32),
+        _decode_video_frames_payload=lambda payload: [],
+        _stage_prefill_embeddings_only=lambda *args, **kwargs: {
+            "success": True,
+            "inputs_embeds": torch.ones(2, 4),
+            "input_token_ids": [10, 11],
+        },
+        stage_padding_token_id=lambda: 0,
+    )
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "llm"
+    model._minicpmo45_duplex_data_plane_helper = helper
+    model.get_input_embeddings = lambda input_ids, multimodal_embeddings=None: torch.zeros(
+        input_ids.shape[0], 4
+    )
+
+    _, _, update = model.preprocess(
+        torch.tensor([0, 0]),
+        duplex_prompt_len=2,
+        duplex_token_offset=0,
+        duplex={
+            "data_plane": True,
+            "session_id": session_key[0],
+            "incarnation": session_key[1],
+            "epoch": 0,
+            "seq": 9,
+            "final": False,
+            "payload": {
+                "audio": "unused-by-test-double",
+                "audio_end_ms": 9000,
+                "is_speech": True,
+            },
+        },
+    )
+
+    assert update["duplex"]["source_input_seq"] == 9
+    assert update["duplex"]["source_audio_end_ms"] == 9000
+
+    _, _, continuation_update = model.preprocess(
+        torch.tensor([0, 0]),
+        duplex_prompt_len=2,
+        duplex_token_offset=0,
+        duplex={
+            "data_plane": True,
+            "session_id": session_key[0],
+            "incarnation": session_key[1],
+            "epoch": 0,
+            "seq": 10,
+            "final": False,
+            "payload": {
+                "audio": "model-generated-silence",
+                "is_speech": False,
+            },
+        },
+    )
+
+    assert continuation_update["duplex"]["source_input_seq"] == 10
+    assert continuation_update["duplex"]["source_audio_end_ms"] == -1
+
+
 def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
@@ -511,6 +580,8 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
                 "duplex": {
                     "duplex_prompt_token_ids": [101, 102],
                     "special_token_ids": {"listen_token_id": 701},
+                    "source_input_seq": 3,
+                    "source_audio_end_ms": 3000,
                 },
             },
             {
@@ -518,6 +589,8 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
                 "duplex": {
                     "duplex_prompt_token_ids": [201, 202, 203],
                     "special_token_ids": {"listen_token_id": 702},
+                    "source_input_seq": 8,
+                    "source_audio_end_ms": 8000,
                 },
             },
         ],
@@ -525,10 +598,16 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
 
     prompt_rows = output.multimodal_outputs["duplex_prompt_token_ids"]
     listen_rows = output.multimodal_outputs["meta"]["listen_token_id"]
+    source_input_rows = output.multimodal_outputs["meta"]["source_input_seq"]
+    source_audio_end_rows = output.multimodal_outputs["meta"]["source_audio_end_ms"]
     assert to_payload_element(prompt_rows, 0, 0, 2) == [101, 102]
     assert to_payload_element(prompt_rows, 1, 2, 4) == [201, 202, 203]
     assert int(to_payload_element(listen_rows, 0, 0, 2).reshape(-1)[0]) == 701
     assert int(to_payload_element(listen_rows, 1, 2, 4).reshape(-1)[0]) == 702
+    assert int(to_payload_element(source_input_rows, 0, 0, 2).reshape(-1)[0]) == 3
+    assert int(to_payload_element(source_input_rows, 1, 2, 4).reshape(-1)[0]) == 8
+    assert int(to_payload_element(source_audio_end_rows, 0, 0, 2).reshape(-1)[0]) == 3000
+    assert int(to_payload_element(source_audio_end_rows, 1, 2, 4).reshape(-1)[0]) == 8000
 
 
 def test_minicpmo_stage0_rejects_invalid_resolved_ref_audio():

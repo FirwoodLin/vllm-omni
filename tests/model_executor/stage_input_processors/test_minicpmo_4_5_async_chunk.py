@@ -49,6 +49,8 @@ def _duplex_delta(
     turn_id: int = 7,
     text: str = "segment",
     turn_end: bool = False,
+    source_input_seq: int = 11,
+    source_audio_end_ms: int = 11000,
 ):
     text_utf8 = torch.tensor(list(text.encode("utf-8")), dtype=torch.uint8)
     return {
@@ -58,6 +60,8 @@ def _duplex_delta(
             "native_duplex": torch.tensor(True),
             "duplex_epoch": torch.tensor(epoch),
             "duplex_turn_id": torch.tensor(turn_id),
+            "source_input_seq": torch.tensor(source_input_seq),
+            "source_audio_end_ms": torch.tensor(source_audio_end_ms),
             "llm_output_text_utf8": text_utf8,
             "turn_end": torch.tensor(turn_end),
         },
@@ -193,6 +197,8 @@ def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
     )
     assert payload.meta.duplex_epoch == 3
     assert payload.meta.duplex_turn_id == 7
+    assert payload.meta.source_input_seq == 11
+    assert payload.meta.source_audio_end_ms == 11000
     assert payload.meta.tts_is_last_chunk is True
     assert payload.meta.turn_end is True
 

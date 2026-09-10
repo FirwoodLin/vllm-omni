@@ -360,3 +360,45 @@ class TestPromptAndMultiModal:
             _streaming_context=object(),
         )
         assert len(out) == 1
+
+    def test_native_handoff_uses_thinker_source_input_identity(self) -> None:
+        special_token_ids = {
+            "tts_bos_token_id": 100,
+            "listen_token_id": 101,
+            "speak_token_id": 102,
+            "tts_eos_token_id": 103,
+        }
+        mm_output = {
+            "latent": torch.zeros((4, _HIDDEN_DIM)),
+            "duplex_prompt_token_ids": [10],
+            "special_token_ids": special_token_ids,
+            "meta": {
+                "source_input_seq": torch.tensor([7]),
+                "source_audio_end_ms": torch.tensor([7000]),
+            },
+        }
+        streaming_context = SimpleNamespace(
+            bridge_states={
+                "duplex": {
+                    "session_id": "sid-source",
+                    "epoch": 0,
+                    "turn_id": 0,
+                }
+            }
+        )
+
+        output = llm2tts(
+            [
+                _make_thinker_output(
+                    prompt_token_ids=[10],
+                    output_token_ids=[102, 20, 103],
+                    request_multimodal_output=mm_output,
+                )
+            ],
+            prompt=None,
+            _streaming_context=streaming_context,
+        )[0]
+
+        duplex = output["model_intermediate_buffer"]["duplex"]
+        assert duplex["source_input_seq"] == 7
+        assert duplex["source_audio_end_ms"] == 7000

@@ -1,0 +1,40 @@
+# Six Thinker replicas, four Talker replicas, and two Code2Wav replicas.
+#
+# This is a controlled downstream experiment for the
+# thinker6_downstream_colocated baseline: Stage 0 stays on GPUs 0-5,
+# Code2Wav stays at two replicas on GPUs 6-7, and Talker is expanded to four
+# replicas by explicitly round-robin placing two replicas on each downstream
+# GPU.
+base_config: base_h200_b32_fullgraph256.yaml
+
+active_stream_window: 64
+duplex_session:
+  max_sessions: 64
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3,4,5"
+    num_replicas: 6
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.9
+
+  - stage_id: 1
+    devices: "6,7,6,7"
+    num_replicas: 4
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.20
+
+  - stage_id: 2
+    devices: "6,7"
+    num_replicas: 2
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.25
+
+# Four Talker processes share two physical GPUs in this experiment. Use a
+# fixed, small per-process KV budget so concurrent initialization does not
+# make the vLLM memory profiler reject the second process on each GPU.
+platforms:
+  cuda:
+    stages:
+      - stage_id: 1
+        kv_cache_memory_bytes: 2147483648  # 2 GiB per Talker replica

@@ -748,7 +748,20 @@ class RealtimeDuplexClient:
             played_ms = len(pcm16) * 1000 // (self.events.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
             await self.send_playback_ack(response_id, played_ms)
 
-    async def send_playback_ack(self, response_id: str, played_ms: int) -> None:
+    async def send_playback_ack(
+        self,
+        response_id: str,
+        played_ms: int,
+        *,
+        commit: bool = True,
+    ) -> None:
+        """Report simulated playback progress for one response.
+
+        ``commit=False`` mirrors the browser worklet's periodic progress
+        observations.  The terminal drained observation keeps the historical
+        default, commits the played prefix, and therefore remains backwards
+        compatible with existing benchmark callers.
+        """
         observation_seq = self._playback_observation_seq.get(response_id, 0)
         self._playback_observation_seq[response_id] = observation_seq + 1
         await self.send(
@@ -757,8 +770,8 @@ class RealtimeDuplexClient:
                 **self.events.playback_identity(response_id),
                 "observation_seq": observation_seq,
                 "played_ms": played_ms,
-                "commit": True,
-                "committed_ms": played_ms,
+                "commit": commit,
+                **({"committed_ms": played_ms} if commit else {}),
             }
         )
 

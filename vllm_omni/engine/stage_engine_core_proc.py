@@ -58,6 +58,7 @@ class StageEngineCoreProc(EngineCoreProc):
         """Preserve omni payloads when vLLM builds its scheduler request."""
         scheduler_request, current_wave = super().preprocess_add_request(request)
         scheduler_request.additional_information = request.additional_information
+        scheduler_request.model_intermediate_buffer = request.model_intermediate_buffer
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         return scheduler_request, current_wave
 

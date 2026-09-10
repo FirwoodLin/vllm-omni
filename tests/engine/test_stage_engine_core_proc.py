@@ -12,6 +12,10 @@ def test_preprocess_add_request_preserves_omni_fields():
         request_id="internal",
         external_req_id="external",
         additional_information={"conditioning": "payload"},
+        model_intermediate_buffer={
+            "ids": {"tts": [21, 22]},
+            "hidden_states": {"tts": [[0.1, 0.2], [0.3, 0.4]]},
+        },
     )
     scheduler_request = SimpleNamespace()
 
@@ -26,3 +30,4 @@ def test_preprocess_add_request_preserves_omni_fields():
     assert current_wave == 3
     assert result.external_req_id == "external"
     assert result.additional_information == {"conditioning": "payload"}
+    assert result.model_intermediate_buffer == request.model_intermediate_buffer

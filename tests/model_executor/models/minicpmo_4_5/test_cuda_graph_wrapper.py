@@ -87,6 +87,7 @@ def test_hift_graph_accepts_configured_lazy_graph_limit() -> None:
 
     assert wrapper.capture_batch_sizes == [1, 2]
     assert wrapper.max_lazy_graphs == 23
+    assert wrapper.allow_lazy_capture is True
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -168,6 +169,19 @@ def test_unseen_shape_is_lazily_captured(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_lazy_capture_limit_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch) -> None:
     wrapper = _fake_wrapper(monkeypatch)
     wrapper.lazy_graph_count = wrapper.max_lazy_graphs
+    speech_feat = torch.randn(1, 80, 9)
+    cache_source = torch.zeros(1, 1, 0)
+
+    result = wrapper.replay(speech_feat, cache_source)
+
+    wrapper._capture.assert_not_called()
+    wrapper.decode_fn.assert_called_once_with(speech_feat, cache_source)
+    assert result is wrapper.decode_fn.return_value
+
+
+def test_hift_uncaptured_shape_can_be_forced_eager(monkeypatch: pytest.MonkeyPatch) -> None:
+    wrapper = _fake_wrapper(monkeypatch)
+    wrapper.allow_lazy_capture = False
     speech_feat = torch.randn(1, 80, 9)
     cache_source = torch.zeros(1, 1, 0)
 
@@ -330,6 +344,20 @@ def test_cfm_unseen_shape_is_lazily_captured(monkeypatch: pytest.MonkeyPatch) ->
 
     wrapper._capture.assert_called_once()
     wrapper.graph_fn.assert_called_once()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cfm_uncaptured_shape_can_be_forced_eager(monkeypatch: pytest.MonkeyPatch) -> None:
+    wrapper = _cfm_mock_wrapper(monkeypatch)
+    wrapper.allow_lazy_capture = False
+
+    inputs = _cfm_inputs(2, 10, 0)
+    wrapper.replay(*inputs)
+
+    wrapper._capture.assert_not_called()
+    wrapper.graph_fn.assert_called_once()
+    assert wrapper._stats["misses"] == 1
+    assert wrapper._stats["eager"] == 1
 
 
 def test_cfm_returning_no_entry_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch) -> None:

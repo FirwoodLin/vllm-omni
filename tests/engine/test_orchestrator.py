@@ -2566,6 +2566,26 @@ async def test_orchestrator_records_scheduler_stats_without_outputs(orchestrator
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_keeps_dynamic_replica_output_when_metrics_index_is_missing(orchestrator_factory) -> None:
+    """A late headless replica must not crash output processing on metrics."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    processor = RecordingOutputProcessor()
+    orchestrator_fixture = orchestrator_factory([stage0], output_processors=[processor], log_stats=True)
+    stat_logger = RecordingStatLogger()
+    orchestrator_fixture.orchestrator._stat_logger = stat_logger
+    # Dynamic membership can attach a client after the static map was built.
+    orchestrator_fixture.orchestrator._stage_replica_to_engine_idx.clear()
+
+    try:
+        stage0.push_engine_core_outputs(_engine_core_outputs("dynamic-replica-output", 1.0))
+
+        await _wait_for(lambda: bool(processor.process_calls))
+        assert stat_logger.records == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_does_not_build_iteration_stats_for_finished_only_batch(orchestrator_factory) -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=True)
     processor = RecordingOutputProcessor()

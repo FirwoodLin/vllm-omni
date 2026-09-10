@@ -16,6 +16,7 @@ class HiFTGraphWrapper:
         connector_config,
         capture_batch_sizes,
         max_lazy_graphs: int = 8,
+        allow_lazy_capture: bool = True,
     ):
         self.decode_fn = token2wav.hift.inference
         self.graph_fn = token2wav.hift._inference_pre_istft
@@ -43,6 +44,7 @@ class HiFTGraphWrapper:
         self.max_lazy_graphs = int(max_lazy_graphs)
         if self.max_lazy_graphs < 0:
             raise ValueError("HiFT max_lazy_graphs must be non-negative")
+        self.allow_lazy_capture = bool(allow_lazy_capture)
         self.lazy_graph_count = 0
 
     def derive_capture_bucket_size(self):
@@ -122,6 +124,9 @@ class HiFTGraphWrapper:
         key = (target_b, num_frames, cache_source_len)
 
         if key not in self.graph:
+            if not getattr(self, "allow_lazy_capture", True):
+                logger.info("Falling back to eager HiFT inference for uncaptured shape %s", key)
+                return self.decode_fn(speech_feat, cache_source)
             if self.lazy_graph_count >= self.max_lazy_graphs:
                 logger.info("Falling back to eager HiFT inference after reaching the lazy Graph limit")
                 return self.decode_fn(speech_feat, cache_source)
@@ -204,10 +209,12 @@ class CFMGraphWrapper:
     belongs to something else. Retiring the whole generation bounds the cache
     without ever leaving a live graph behind a freed one.
 
-    Cache misses capture. A capture failure disables the wrapper for the rest
-    of the process, while a key whose static buffers cannot be rebuilt sends
-    only that one shape eager. Outputs are cloned after replay to prevent
-    streaming cache corruption.
+    Cache misses capture when ``allow_lazy_capture`` is enabled. Deployments
+    can prewarm a finite shape census and disable live capture; those misses
+    go eager instead. A capture failure disables the wrapper for the rest of
+    the process, while a key whose static buffers cannot be rebuilt sends only
+    that one shape eager. Outputs are cloned after replay to prevent streaming
+    cache corruption.
     """
 
     def __init__(
@@ -215,9 +222,11 @@ class CFMGraphWrapper:
         graph_fn,
         *,
         max_graphs: int = 32,
+        allow_lazy_capture: bool = True,
     ) -> None:
         self.graph_fn = graph_fn
         self.max_graphs = int(max_graphs)
+        self.allow_lazy_capture = bool(allow_lazy_capture)
         self.device = next(graph_fn.__self__.parameters()).device
         # A non-positive budget means "no graphs", the same as
         # `enable_cfm_graph: false`. Clamping to 1 would instead build a
@@ -232,6 +241,7 @@ class CFMGraphWrapper:
             "captures": 0,
             "flushes": 0,
             "eager": 0,
+            "misses": 0,
         }
 
     def stats_snapshot(self) -> dict[str, int]:
@@ -336,6 +346,11 @@ class CFMGraphWrapper:
         entry = self._cache.get(key)
 
         if entry is None:
+            self._stats.setdefault("misses", 0)
+            self._stats["misses"] += 1
+            if not getattr(self, "allow_lazy_capture", True):
+                logger.info("Falling back to eager CFM inference for uncaptured shape %s", key)
+                return self._eager(inputs)
             if len(self._cache) >= self.max_graphs:
                 self._flush()
             entry = self._capture(key)

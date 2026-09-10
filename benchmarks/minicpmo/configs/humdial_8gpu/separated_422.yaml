@@ -1,0 +1,21 @@
+# Four Thinker, two Talker, and two Code2Wav replicas on disjoint GPUs.
+base_config: base_h200_b32_fullgraph256.yaml
+
+active_stream_window: 64
+duplex_session:
+  max_sessions: 64
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    num_replicas: 4
+
+  - stage_id: 1
+    devices: "4,5"
+    num_replicas: 2
+    gpu_memory_utilization: 0.2
+
+  - stage_id: 2
+    devices: "6,7"
+    num_replicas: 2
+

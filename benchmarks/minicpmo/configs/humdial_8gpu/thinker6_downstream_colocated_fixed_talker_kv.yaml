@@ -1,0 +1,33 @@
+# Control for thinker6_talker4_downstream_colocated: retain the original
+# 6/2/2 replica layout, but use the same fixed 2 GiB Stage-1 KV budget as the
+# four-Talker experiment so the comparison changes only replica placement.
+base_config: base_h200_b32_fullgraph256.yaml
+
+active_stream_window: 64
+duplex_session:
+  max_sessions: 64
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3,4,5"
+    num_replicas: 6
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.9
+
+  - stage_id: 1
+    devices: "6,7"
+    num_replicas: 2
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.20
+
+  - stage_id: 2
+    devices: "6,7"
+    num_replicas: 2
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.25
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 1
+        kv_cache_memory_bytes: 2147483648  # 2 GiB per Talker replica

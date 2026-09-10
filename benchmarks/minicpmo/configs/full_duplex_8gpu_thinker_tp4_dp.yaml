@@ -1,0 +1,20 @@
+# MiniCPM-o 4.5 native full-duplex benchmark topology.
+# Thinker uses TP4 on GPUs 0-3; Talker and Code2Wav each use two one-GPU
+# data-parallel replicas on GPUs 4-5 and 6-7 respectively.
+base_config: ../../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml
+
+pipeline: minicpmo_4_5
+session_mode: duplex
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    tensor_parallel_size: 4
+
+  - stage_id: 1
+    devices: "4,5"
+    num_replicas: 2
+
+  - stage_id: 2
+    devices: "6,7"
+    num_replicas: 2
