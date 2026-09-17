@@ -40,7 +40,7 @@ except ModuleNotFoundError:  # direct ``python benchmarks/minicpmo/...``
         discover_humdial_cases,
     )
 
-from vllm_omni.experimental.fullduplex.client import (
+from vllm_omni.clients.duplex import (
     PCM16_BYTES_PER_SAMPLE,
     PCM16_SAMPLE_RATE,
     read_pcm16_wav,

@@ -19,7 +19,6 @@ from vllm_omni.config.stage_config import (
 _PROC = "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni"
 MINICPMO45_REFERENCE_AUDIO_KEY = "_minicpmo45_reference_audio"
 
-
 MINICPMO_4_5_PIPELINE = PipelineConfig(
     model_type="minicpmo_4_5",
     default_deploy_config_name="minicpmo_4_5.yaml",
@@ -84,6 +83,75 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             sync_process_input_func=f"{_PROC}.tts2code2wav_token_only",
             sampling_constraints={"detokenize": True},
             requires_full_payload_input=True,
+        ),
+    ),
+)
+
+
+# Thinker-only variant: multimodal understanding -> text, no talker/code2wav.
+# Modeled on the ming_flash_omni / qwen2_5_omni / audex thinker-only pipelines.
+# Stage 0 is a byte-for-byte copy of the full pipeline's stage 0 (same
+# model_stage="llm" and default arch resolution); only the duplex handoff
+# fields and the latent output type are dropped.
+MINICPMO_4_5_THINKER_ONLY_PIPELINE = PipelineConfig(
+    model_type="minicpmo_4_5_thinker_only",
+    # Pipeline-level arch override: without it vLLM resolves the checkpoint's
+    # bare `MiniCPMO` architectures entry to upstream minicpmv.py instead of
+    # the 4.5 omni implementation.
+    model_arch="MiniCPMO45OmniForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="llm",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            engine_output_type="text",
+            sampling_constraints={"detokenize": True},
+        ),
+    ),
+)
+
+
+# Thinker + Talker variant: text (with tts_bos) -> codec tokens, no code2wav.
+# Stage 0 is identical to the full pipeline's stage 0 (latent handoff to the
+# talker via ``llm2tts``); stage 1 is identical to the full pipeline's stage 1
+# except it becomes the final stage so the pipeline terminates after the
+# Talker. Used for isolated Talker benchmarks on the production engine path.
+MINICPMO_4_5_THINKER_TALKER_PIPELINE = PipelineConfig(
+    model_type="minicpmo_4_5_thinker_talker",
+    model_arch="MiniCPMO45OmniForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="llm",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            final_output=False,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            engine_output_type="latent",
+            sampling_constraints={"detokenize": True},
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="tts",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(0,),
+            hf_config_name="tts_config",
+            final_output=True,
+            final_output_type="latent",
+            engine_output_type="latent",
+            custom_process_input_func=f"{_PROC}.llm2tts",
+            sampling_constraints={
+                "detokenize": False,
+                # MiniCPM-o 4.5 codec EOS is tts_config.num_audio_tokens - 1.
+                "stop_token_ids": [6561],
+            },
         ),
     ),
 )

@@ -26,6 +26,7 @@ from typing import Any
 import torch
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+    _SILENCE_TOKEN as SILENCE_TOKEN,
     BatchedToken2Wav,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
@@ -33,7 +34,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import 
 )
 
 DEFAULT_MODEL = Path("/mnt/shared-storage-user/gpfs2-shared-public/huggingface/zskj-hub/models--OpenBMB--MiniCPM-o-4_5")
-SILENCE_TOKEN = 4218
 
 
 @dataclass

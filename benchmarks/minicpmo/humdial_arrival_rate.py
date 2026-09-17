@@ -22,18 +22,19 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-from vllm_omni.experimental.fullduplex.client import (
+from vllm_omni.clients.duplex import (
     PCM16_BYTES_PER_SAMPLE,
     PCM16_SAMPLE_RATE,
-    RealtimeDuplexClient,
-    build_realtime_url,
+    chunk_period_ms as negotiated_chunk_period_ms,
     read_pcm16_wav,
     reference_audio_data_url,
     summarize_session_request_metrics,
 )
-from vllm_omni.experimental.fullduplex.client import (
-    chunk_period_ms as negotiated_chunk_period_ms,
-)
+
+try:
+    from benchmarks.minicpmo.duplex_probe_client import ProbeEventCollector, RealtimeSession
+except ModuleNotFoundError:  # direct ``python benchmarks/minicpmo/humdial_arrival_rate.py``
+    from duplex_probe_client import ProbeEventCollector, RealtimeSession
 
 DEFAULT_DATASET_ROOT = Path(
     "/mnt/nvme1n1/ml_research/linbinbin1/src-omni-modal/Humdial-Track2-Test"
@@ -302,7 +303,7 @@ class BrowserPlaybackClock:
                     state.underrun_started_at_s = exhausted_at_s
         state.updated_at_s = now_s
 
-    def _ingest(self, client: RealtimeDuplexClient) -> None:
+    def _ingest(self, client: RealtimeSession) -> None:
         events = client.events
         while self.cursor < len(events.events):
             index, self.cursor = self.cursor, self.cursor + 1
@@ -333,7 +334,7 @@ class BrowserPlaybackClock:
                 state.playing = False
                 state.resume_at_s = None
 
-    async def step(self, client: RealtimeDuplexClient) -> None:
+    async def step(self, client: RealtimeSession) -> None:
         self._ingest(client)
         now_s = time.monotonic()
         for response_id, state in self.responses.items():
@@ -350,7 +351,7 @@ class BrowserPlaybackClock:
                 await client.send_playback_ack(response_id, int(state.queued_ms), commit=True)
                 state.final_acked = True
 
-    async def run(self, client: RealtimeDuplexClient, stop: asyncio.Event) -> None:
+    async def run(self, client: RealtimeSession, stop: asyncio.Event) -> None:
         while not stop.is_set():
             await self.step(client)
             try:
@@ -392,7 +393,7 @@ class BrowserPlaybackClock:
 
 
 async def _stream_pcm16_absolute(
-    client: RealtimeDuplexClient,
+    client: RealtimeSession,
     pcm16: bytes,
     *,
     chunk_ms: int,
@@ -546,7 +547,7 @@ def _model_unit_decision_metrics(
 
 
 def _response_metrics(
-    client: RealtimeDuplexClient,
+    client: RealtimeSession,
     *,
     stream_started_at_s: float,
     session_id: str,
@@ -606,7 +607,7 @@ async def run_one_session(
         "input_duration_s": request.case.duration_s,
         "success": False,
     }
-    client: RealtimeDuplexClient | None = None
+    client: RealtimeSession | None = None
     player_task: asyncio.Task[None] | None = None
     player_stop = asyncio.Event()
     player = BrowserPlaybackClock(
@@ -614,24 +615,17 @@ async def run_one_session(
         progress_ms=playback_progress_ms,
     )
     try:
-        realtime_url = build_realtime_url(
+        async with RealtimeSession(
             url,
-            model,
-            autostart=False,
-            native_duplex=True,
+            model=model,
             session_id=session_id,
-        )
-        async with RealtimeDuplexClient(realtime_url) as client:
-            await client.configure(
-                model,
-                ref_audio=ref_audio_data_url,
-                native_duplex=True,
-                auto_response=True,
-                temperature=0.0,
-                session_id=session_id,
-                idle_timeout_s=max(timeout_s, request.case.duration_s + tail_drain_s + 30.0),
-                timeout_s=min(timeout_s, 60.0),
-            )
+            ref_audio=ref_audio_data_url,
+            native_duplex=True,
+            auto_response=True,
+            temperature=0.0,
+            idle_timeout_s=max(timeout_s, request.case.duration_s + tail_drain_s + 30.0),
+            handshake_timeout_s=min(timeout_s, 60.0),
+        ) as client:
             player_task = asyncio.create_task(player.run(client, player_stop))
             stream_started_at_s = time.monotonic()
             result["connection_setup_ms"] = (stream_started_at_s - started_at_s) * 1000.0

@@ -28,15 +28,18 @@ try:
 except ModuleNotFoundError:  # direct ``python benchmarks/minicpmo/humdial_e2e.py``
     from humdial_arrival_rate import BrowserPlaybackClock
 
-from vllm_omni.experimental.fullduplex.client import (
+from vllm_omni.clients.duplex import (
     PCM16_BYTES_PER_SAMPLE,
     PCM16_SAMPLE_RATE,
-    RealtimeDuplexClient,
-    build_realtime_url,
     read_pcm16_wav,
     reference_audio_data_url,
-    wait_for,
+    wait_for_condition as wait_for,
 )
+
+try:
+    from benchmarks.minicpmo.duplex_probe_client import RealtimeSession
+except ModuleNotFoundError:  # direct ``python benchmarks/minicpmo/humdial_e2e.py``
+    from duplex_probe_client import RealtimeSession
 
 DEFAULT_MODEL = Path("/mnt/shared-storage-user/gpfs2-shared-public/huggingface/zskj-hub/models--OpenBMB--MiniCPM-o-4_5")
 MANIFEST_SCHEMA_VERSION = 1
@@ -323,7 +326,7 @@ class EventLedger:
         )
         return now
 
-    def server_events(self, client: RealtimeDuplexClient) -> None:
+    def server_events(self, client: RealtimeSession) -> None:
         for seq, (event, received_at_s) in enumerate(
             zip(client.events.events, client.events.event_received_at_s, strict=True)
         ):
@@ -369,7 +372,7 @@ class SimulatedPlaybackAdapter:
         self.stop = asyncio.Event()
         self.task: asyncio.Task[None] | None = None
 
-    async def start(self, client: RealtimeDuplexClient) -> None:
+    async def start(self, client: RealtimeSession) -> None:
         self.task = asyncio.create_task(self.clock.run(client, self.stop))
 
     def rendered_ms(self, response_id: str) -> float | None:
@@ -398,7 +401,7 @@ class SimulatedPlaybackAdapter:
             self.task = None
 
 
-async def _wait_response_created(client: RealtimeDuplexClient, *, after_count: int, timeout_s: float) -> str:
+async def _wait_response_created(client: RealtimeSession, *, after_count: int, timeout_s: float) -> str:
     await wait_for(
         lambda: len(client.events.response_ids) > after_count,
         timeout_s=timeout_s,
@@ -407,7 +410,7 @@ async def _wait_response_created(client: RealtimeDuplexClient, *, after_count: i
     return client.events.response_ids[after_count]
 
 
-async def _wait_input_audio_committed(client: RealtimeDuplexClient, *, count: int, timeout_s: float) -> None:
+async def _wait_input_audio_committed(client: RealtimeSession, *, count: int, timeout_s: float) -> None:
     await wait_for(
         lambda: client.events.count("input_audio_buffer.committed") >= count,
         timeout_s=timeout_s,
@@ -442,7 +445,7 @@ async def _run_case(
         "stale_audio_ms": 0.0,
     }
     ledger = EventLedger(session_id)
-    client: RealtimeDuplexClient | None = None
+    client: RealtimeSession | None = None
     player: SimulatedPlaybackAdapter | None = None
     stream_started_at_s = time.monotonic()
     commit_at_s: float | None = None
@@ -460,22 +463,20 @@ async def _run_case(
     try:
         initial_pcm = read_pcm16_wav(case.initial_audio)
         interrupt_pcm = read_pcm16_wav(case.interrupt_audio)
-        client = RealtimeDuplexClient(
-            build_realtime_url(args.url, str(args.model), autostart=False, native_duplex=True, session_id=session_id)
+        client = RealtimeSession(
+            args.url,
+            model=str(args.model),
+            session_id=session_id,
+            ref_audio=ref_audio,
+            instructions=case.instructions,
+            native_duplex=True,
+            auto_response=not args.explicit_all_responses,
+            temperature=0.0,
+            idle_timeout_s=max(args.timeout_s, case.session_window_s + args.tail_drain_s + 30.0),
+            handshake_timeout_s=min(args.timeout_s, 60.0),
         )
         await client.__aenter__()
         try:
-            await client.configure(
-                str(args.model),
-                ref_audio=ref_audio,
-                instructions=case.instructions,
-                native_duplex=True,
-                auto_response=not args.explicit_all_responses,
-                temperature=0.0,
-                session_id=session_id,
-                idle_timeout_s=max(args.timeout_s, case.session_window_s + args.tail_drain_s + 30.0),
-                timeout_s=min(args.timeout_s, 60.0),
-            )
             player = SimulatedPlaybackAdapter(
                 initial_buffer_ms=args.playback_initial_buffer_ms,
                 progress_ms=args.playback_progress_ms,

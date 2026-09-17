@@ -1148,6 +1148,64 @@ async def _send_clean_turn(
     return response_id, "speak"
 
 
+def _playback_identity(collector: EventCollector, response_id: str) -> dict[str, object]:
+    """Extract the playback.ack identity fields the merged server contract requires.
+
+    The trunk EventCollector does not carry this (kept trunk-clean during the
+    legacy-client migration), so the extraction lives here, mirroring
+    benchmarks/minicpmo/duplex_probe_client.py ProbeEventCollector.
+    """
+    session_id: str | None = None
+    incarnation: int | None = None
+    epoch: int | None = None
+    for event in collector.events:
+        if event.get("type") == "session.created":
+            session = event.get("session")
+            if isinstance(session, dict):
+                raw_session_id = session.get("id") or session.get("session_id")
+                if isinstance(raw_session_id, str) and raw_session_id:
+                    session_id = raw_session_id
+                raw_epoch = session.get("epoch")
+                if isinstance(raw_epoch, int) and not isinstance(raw_epoch, bool):
+                    epoch = raw_epoch
+            raw_incarnation = event.get("incarnation")
+            if isinstance(raw_incarnation, int) and not isinstance(raw_incarnation, bool):
+                incarnation = raw_incarnation
+        if event.get("type") != "response.created" or EventCollector.response_id(event) != response_id:
+            continue
+        raw_session_id = event.get("session_id")
+        raw_incarnation = event.get("incarnation")
+        raw_epoch = event.get("epoch")
+        if isinstance(raw_session_id, str) and raw_session_id:
+            session_id = raw_session_id
+        if isinstance(raw_incarnation, int) and not isinstance(raw_incarnation, bool):
+            incarnation = raw_incarnation
+        if isinstance(raw_epoch, int) and not isinstance(raw_epoch, bool):
+            epoch = raw_epoch
+        response = event.get("response")
+        metadata = response.get("metadata") if isinstance(response, dict) else None
+        duplex_event = metadata.get("duplex_event") if isinstance(metadata, dict) else None
+        if isinstance(duplex_event, dict):
+            nested_session_id = duplex_event.get("session_id")
+            nested_incarnation = duplex_event.get("incarnation")
+            nested_epoch = duplex_event.get("epoch")
+            if isinstance(nested_session_id, str) and nested_session_id:
+                session_id = nested_session_id
+            if isinstance(nested_incarnation, int) and not isinstance(nested_incarnation, bool):
+                incarnation = nested_incarnation
+            if isinstance(nested_epoch, int) and not isinstance(nested_epoch, bool):
+                epoch = nested_epoch
+    if session_id is None or incarnation is None or epoch is None:
+        raise RuntimeError(f"Missing playback identity for response {response_id}")
+    return {
+        "session_id": session_id,
+        "incarnation": incarnation,
+        "epoch": epoch,
+        "response_id": response_id,
+        "item_id": f"item_{response_id}",
+    }
+
+
 async def _ack_response_playback(
     ws,
     state: DemoState,
@@ -1164,7 +1222,7 @@ async def _ack_response_playback(
         json.dumps(
             {
                 "type": "playback.ack",
-                **state.timing_events.playback_identity(response_id),
+                **_playback_identity(state.timing_events, response_id),
                 "observation_seq": 0,
                 "played_ms": played_ms,
                 "commit": True,

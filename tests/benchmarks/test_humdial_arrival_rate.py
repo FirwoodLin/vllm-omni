@@ -12,16 +12,26 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.experimental.fullduplex.client import RealtimeDuplexClient, RealtimeEventCollector
+from vllm_omni.clients.duplex import EventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 SCRIPT = Path(__file__).parents[2] / "benchmarks" / "minicpmo" / "humdial_arrival_rate.py"
 LAUNCHER = SCRIPT.with_name("benchmark_humdial_service.py")
+ADAPTER = SCRIPT.with_name("duplex_probe_client.py")
 
 
 def _load_module():
     spec = importlib.util.spec_from_file_location("humdial_arrival_rate_test", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_probe_client():
+    spec = importlib.util.spec_from_file_location("duplex_probe_client_test", ADAPTER)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -123,7 +133,7 @@ def test_schedule_has_exact_rate_count_sorted_random_arrivals_and_stable_manifes
 async def test_playback_clock_sends_progress_then_terminal_commit():
     module = _load_module()
     received_at = module.time.monotonic() - 1.0
-    collector = RealtimeEventCollector()
+    collector = EventCollector()
     collector.add(
         {
             "type": "session.created",
@@ -172,29 +182,45 @@ async def test_playback_clock_sends_progress_then_terminal_commit():
     assert clock.summary()["final_ack_count"] == 1
 
 
-def test_realtime_client_progress_ack_omits_committed_cursor():
+def test_probe_session_progress_ack_sends_identity_and_observation_seq():
+    probe = _load_probe_client()
+
     async def exercise():
-        client = RealtimeDuplexClient("ws://unused")
-        client.events = SimpleNamespace(
-            playback_identity=lambda response_id: {
-                "session_id": "session-0",
-                "incarnation": 1,
-                "epoch": 0,
-                "response_id": response_id,
-                "item_id": f"item_{response_id}",
-            }
-        )
+        session = probe.RealtimeSession("ws://unused", model="test-model", session_id="session-0")
         sent = []
 
         async def send(event):
             sent.append(event)
 
-        client.send = send
-        await client.send_playback_ack("response-0", 80, commit=False)
-        await client.send_playback_ack("response-0", 160)
+        session._client.send = send
+        session.events.add(
+            {
+                "type": "session.created",
+                "session": {"id": "session-0", "epoch": 0},
+                "incarnation": 1,
+            },
+            received_at_s=0.0,
+        )
+        session.events.add(
+            {
+                "type": "response.created",
+                "response_id": "response-0",
+                "session_id": "session-0",
+                "incarnation": 1,
+                "epoch": 0,
+            },
+            received_at_s=0.0,
+        )
+        await session.send_playback_ack("response-0", 80, commit=False)
+        await session.send_playback_ack("response-0", 160)
         return sent
 
     progress, terminal = asyncio.run(exercise())
+    assert progress["session_id"] == "session-0"
+    assert progress["incarnation"] == 1
+    assert progress["epoch"] == 0
+    assert progress["response_id"] == "response-0"
+    assert progress["item_id"] == "item_response-0"
     assert progress["observation_seq"] == 0
     assert progress["commit"] is False
     assert "committed_ms" not in progress
@@ -205,7 +231,7 @@ def test_realtime_client_progress_ack_omits_committed_cursor():
 
 def test_model_unit_decisions_pair_in_order_and_ignore_buffering_events():
     module = _load_module()
-    collector = RealtimeEventCollector()
+    collector = EventCollector()
     collector.add(
         {
             "type": "response.listen",

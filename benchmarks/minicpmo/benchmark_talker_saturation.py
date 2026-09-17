@@ -38,11 +38,13 @@ import torch
 from safetensors import safe_open
 from transformers import AutoConfig
 
+from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+
 DEFAULT_MODEL = Path("/mnt/shared-storage-user/gpfs2-shared-public/huggingface/zskj-hub/models--OpenBMB--MiniCPM-o-4_5")
 DEFAULT_BATCH_SIZES = "1,2,4,8"
 DEFAULT_CONDITION_LENGTHS = "8,32,128"
 DEFAULT_KV_LENGTHS = "0,256,1024"
-NATIVE_DUPLEX_TOKENS = 26
+NATIVE_DUPLEX_TOKENS = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 
 
 @dataclass

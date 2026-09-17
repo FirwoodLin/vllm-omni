@@ -24,9 +24,12 @@ import torch
 from safetensors import safe_open
 from transformers import AutoConfig
 
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+
 DEFAULT_MODEL = Path("/mnt/shared-storage-user/gpfs2-shared-public/huggingface/zskj-hub/models--OpenBMB--MiniCPM-o-4_5")
 NATIVE_CONTEXTS = "13,79,256"
 NATIVE_KV = "0,4096,16384"
+NATIVE_SPEAK_TOKENS = MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK
 
 
 @dataclass
@@ -132,7 +135,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kv-lengths", type=lambda x: _csv_ints(x, nonnegative=True), default=_csv_ints(NATIVE_KV, nonnegative=True)
     )
-    parser.add_argument("--generated-tokens", type=int, default=20)
+    parser.add_argument("--generated-tokens", type=int, default=NATIVE_SPEAK_TOKENS)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)

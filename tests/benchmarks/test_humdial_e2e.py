@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
+from vllm_omni.clients.duplex import EventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -137,7 +137,7 @@ def test_timing_origin_falls_back_when_streaming_output_precedes_commit():
     assert module._usable_input_commit_at(events, received_at, "response-1", 10.5) is None
     assert module._timing_measurement_origin(False)["ttfp"].startswith("response.created")
     assert module._usable_input_commit_at(events, received_at, "response-1", 10.1) == 10.1
-    collector = RealtimeEventCollector()
+    collector = EventCollector()
     collector.add(events[0], received_at_s=10.0)
     collector.add(
         {
@@ -160,7 +160,7 @@ def test_timing_origin_falls_back_when_streaming_output_precedes_commit():
 @pytest.mark.asyncio
 async def test_followup_response_id_is_available_before_response_done():
     module = _load_module()
-    client = SimpleNamespace(events=RealtimeEventCollector())
+    client = SimpleNamespace(events=EventCollector())
     client.events.add({"type": "response.created", "response": {"id": "resp-first"}})
     client.events.add({"type": "response.created", "response": {"id": "resp-followup"}})
 

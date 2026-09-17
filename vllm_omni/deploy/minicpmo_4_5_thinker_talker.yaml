@@ -1,0 +1,68 @@
+# MiniCPM-o 4.5 thinker+talker deploy: text (tts_bos) -> codec tokens.
+#
+# Two-stage configuration that drops code2wav, so the Talker runs alone as the
+# final stage on the production vLLM path (piecewise torch.compile prefill +
+# full CUDA-graph decode + paged KV). Companion to
+# benchmarks/minicpmo/benchmark_talker_engine.py. Stage knobs mirror
+# minicpmo_4_5_bs8.yaml stage 0/1 where they affect execution; concurrency is
+# raised to max_num_seqs=32 to expose batched-decode scaling beyond the bs=8
+# duplex target, and the Stage 1 KV cap covers 32 * (condition + 1024)
+# generated codec tokens.
+pipeline: minicpmo_4_5_thinker_talker
+async_chunk: false
+
+trust_remote_code: true
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 32
+    gpu_memory_utilization: 0.60
+    enforce_eager: false
+    tensor_parallel_size: 1
+    max_num_batched_tokens: 32768
+    devices: "0"
+    interleave_mm_strings: true
+    media_io_kwargs:
+      video:
+        fps: 1
+        num_frames: 128
+    limit_mm_per_prompt:
+      image: 64
+      audio: 64
+      video: 1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    max_num_seqs: 32
+    gpu_memory_utilization: 0.25
+    enforce_eager: false
+    max_num_batched_tokens: 8192
+    # Talker context is 4096 (tts_config.max_position_embeddings).
+    max_model_len: 4096
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.8
+      top_p: 0.85
+      top_k: 25
+      repetition_penalty: 1.05
+      min_tokens: 50
+      max_tokens: 4096
+      seed: 42
+      detokenize: false
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 1
+        # Full-attention occupancy is bounded by max_num_seqs * max_model_len
+        # (32 * 4096 = 131072 tokens). Keep the reported CUDA KV token capacity
+        # above that bound because physical-preemption replay is unsupported.
+        kv_cache_memory_bytes: 8589934592  # 8 GiB
