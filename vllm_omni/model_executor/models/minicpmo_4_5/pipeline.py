@@ -155,3 +155,43 @@ MINICPMO_4_5_THINKER_TALKER_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+
+# Talker-only variant: bypasses the Thinker entirely and feeds the Talker
+# with a fake Thinker hidden-state handoff whose length is controlled by the
+# user-supplied token-id list. Used for isolated Talker perf benchmarks on
+# the production engine path (e.g. rolling-KV sweep at fixed KV lengths);
+# generated codec tokens are not meaningful for ASR quality and are only
+# consumed by Talker -> EOS to terminate the request.
+MINICPMO_4_5_TALKER_ONLY_PIPELINE = PipelineConfig(
+    model_type="minicpmo_4_5_talker_only",
+    model_arch="MiniCPMO45OmniForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="tts",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            final_output=True,
+            final_output_type="latent",
+            engine_output_type="latent",
+            hf_config_name="tts_config",
+            # Stage-0 of a single-stage TTS-only pipeline has no upstream
+            # source_outputs; the benchmark script stamps the fake Thinker
+            # handoff straight onto each ``OmniTokensPrompt.model_intermediate_buffer``
+            # and the orchestrator forwards it via ``upgrade_to_omni_request``
+            # into ``GPUModelRunner.model_intermediate_buffer[req_id]``.
+            sampling_constraints={
+                "detokenize": False,
+                # Note: do NOT inject ``stop_token_ids`` here. The TTS-only
+                # engine has Vocabulary size 0 (no tokenizer is loaded for
+                # the codec-only ``tts_config``), and ``SamplingParams.verify``
+                # rejects stop_token_ids >= vocab_size at request time.
+                # The benchmark drives termination via ``max_tokens`` (the
+                # production-engine Talker reaches codec EOS naturally
+                # before that cap at every batch size we care about).
+            },
+        ),
+    ),
+)

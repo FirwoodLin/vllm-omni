@@ -1089,3 +1089,105 @@ def llm2tts(
                     duplex_state["model_turn_id"] = current_model_turn_id + 1
 
     return tts_inputs
+
+
+def fake_llm2tts(
+    source_outputs,
+    prompt: OmniTokensPrompt | TextPrompt = None,
+    requires_multimodal_data: bool = False,
+    _streaming_context=None,
+):
+    """Build Talker conditioning for the Talker-only pipeline (perf benchmarks).
+
+    Real pipeline: Thinker generates hidden states, ``llm2tts`` slices the
+    tts_bos..tts_eos span and hands it off as the Talker prefill. The
+    span length is what makes the Talker's KV cache grow during decode.
+
+    Talker-only pipeline: there is no Thinker. We accept a raw user prompt
+    whose ``prompt_token_ids`` already encodes the desired rolling-KV
+    length (the script pads it with ``0`` IDs to the requested size, plus
+    2 suffix dummies that match the real ``condition_suffix_length``).
+    We then synthesise a Thinker-shaped hidden-state tensor with that length
+    and feed it through the same ``set_tts_handoff`` path. The Talker's
+    first layer projects the Thinker-side 4096-d hidden state down to its
+    internal 768-d embedding, so the projection is shape-correct even when
+    the latents are random Gaussian noise.
+
+    Output codec tokens are garbage (random init) — fine for perf, useless
+    for ASR quality. Sampling terminates on the codec EOS (``6561``).
+    """
+    if not isinstance(prompt, list):
+        prompt_list = [prompt]
+    else:
+        prompt_list = list(prompt)
+
+    tts_inputs = []
+    for p in prompt_list:
+        # Resolve the handoff length from the user-provided prompt. The
+        # benchmark script passes ``prompt_token_ids`` as a flat
+        # ``[0]*(target_kv_length + condition_suffix_length)`` list; we use
+        # the full length as both handoff_ids and hidden slice length to
+        # match the real pipeline's ``max(len(handoff_ids),
+        # len(handoff_hidden)) + condition_suffix_length`` contract.
+        if isinstance(p, OmniTokensPrompt):
+            user_token_ids = list(p.prompt_token_ids or [])
+        elif isinstance(p, TextPrompt):
+            user_token_ids = []
+        elif isinstance(p, dict):
+            user_token_ids = list(p.get("prompt_token_ids") or [])
+        else:
+            user_token_ids = []
+
+        condition_length = len(user_token_ids)
+        if condition_length <= 0:
+            raise ValueError(
+                "fake_llm2tts requires a non-empty prompt_token_ids list "
+                "(the benchmark pads it to the target rolling-KV length)"
+            )
+
+        # handoff_ids are the token ids the Talker conditions on. In the
+        # real pipeline these come from the Thinker's emitted token stream;
+        # here we just reuse whatever the caller provided (typically a
+        # vector of 0s, since Talker.sample() blanks them out of the
+        # repetition penalty anyway).
+        handoff_ids = list(user_token_ids)
+        # handoff_hidden is a Thinker-side latent slice of shape
+        # [condition_length, 4096] (the LLM hidden_size). The Talker's
+        # first layer (``projector_semantic``: 4096 -> 768) projects it
+        # down to the TTS hidden_size, so we must hand back the LLM-side
+        # dim, not the TTS-side one. We use a deterministic seed so reruns
+        # are bit-comparable.
+        gen = torch.Generator(device="cpu").manual_seed(0)
+        handoff_hidden = torch.randn(
+            (condition_length, 4096),
+            generator=gen,
+            dtype=torch.float32,
+        )
+
+        model_intermediate_buffer = build_duplex_intermediate_buffer(
+            request_id="fake_talker_only",
+            prompt_token_ids=user_token_ids,
+            output_token_ids=[],
+            output_text="",
+            stream_output=False,
+            native_duplex=False,
+        )
+        set_tts_handoff(model_intermediate_buffer, handoff_ids, _to_transport_list(handoff_hidden))
+
+        # Tell the Talker scheduler how many KV slots the prefill will
+        # reserve. The real path adds condition_suffix_length; here we
+        # already accounted for that in the caller's prompt length.
+        handoff_meta = model_intermediate_buffer.setdefault("meta", {})
+        handoff_meta["next_stage_prompt_len"] = condition_length
+
+        scheduler_prompt_token_ids = [0] * condition_length
+
+        tts_inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=scheduler_prompt_token_ids,
+                model_intermediate_buffer=model_intermediate_buffer,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+            )
+        )
+    return tts_inputs

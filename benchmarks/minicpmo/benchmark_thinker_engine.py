@@ -253,7 +253,10 @@ def _engine_log_evidence(path: Path | None) -> list[str]:
 
 def main() -> None:
     args = parse_args()
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device)
+    # Respect an externally-set CUDA_VISIBLE_DEVICES (e.g. ``CUDA_VISIBLE_DEVICES=4
+    # python ...``); only fall back to ``--device`` when no env var is present.
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device)
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
 
     import torch

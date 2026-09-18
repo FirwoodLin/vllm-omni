@@ -1,0 +1,22 @@
+# Talker-only deploy: feeds the MiniCPM-o 4.5 Talker with a fake Thinker
+# hidden-state handoff whose length the benchmark controls via
+# ``prompt_token_ids``. No Thinker prefill, no Code2Wav. Used for isolated
+# Talker perf benchmarks on the production engine path (rolling-KV sweep
+# at fixed KV lengths); the synthesised handoff latent is random Gaussian
+# so codec token quality is meaningless, only latency / throughput numbers
+# are valid.
+#
+# Verified on 1x H200.
+pipeline: minicpmo_4_5_talker_only
+async_chunk: false
+trust_remote_code: true
+enable_prefix_caching: false
+stages:
+  - stage_id: 0
+    max_num_seqs: 32
+    gpu_memory_utilization: 0.85
+    enforce_eager: false
+    tensor_parallel_size: 1
+    max_num_batched_tokens: 8192
+    max_model_len: 4096
+    devices: "0"

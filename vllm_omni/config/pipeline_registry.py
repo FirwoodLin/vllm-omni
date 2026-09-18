@@ -90,6 +90,7 @@ from vllm_omni.model_executor.models.ming_tts.pipeline import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import (
     MINICPMO_4_5_PIPELINE,
+    MINICPMO_4_5_TALKER_ONLY_PIPELINE,
     MINICPMO_4_5_THINKER_ONLY_PIPELINE,
     MINICPMO_4_5_THINKER_TALKER_PIPELINE,
 )
@@ -193,6 +194,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "minicpmo_4_5": MINICPMO_4_5_PIPELINE,
     "minicpmo_4_5_thinker_only": MINICPMO_4_5_THINKER_ONLY_PIPELINE,
     "minicpmo_4_5_thinker_talker": MINICPMO_4_5_THINKER_TALKER_PIPELINE,
+    "minicpmo_4_5_talker_only": MINICPMO_4_5_TALKER_ONLY_PIPELINE,
     "minimax_music3": MINIMAX_MUSIC3_PIPELINE,
     "higgs_audio_v2": HIGGS_AUDIO_V2_PIPELINE,
     "higgs_multimodal_qwen3": HIGGS_AUDIO_V3_PIPELINE,
