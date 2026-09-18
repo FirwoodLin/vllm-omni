@@ -74,11 +74,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage-init-timeout", type=int, default=1500)
     parser.add_argument("--batch-timeout", type=int, default=5)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help=(
+            "Override engine max_num_seqs (e.g. to test batch sizes above the "
+            "deploy config's default). Mirrors benchmark_thinker_engine.py."
+        ),
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Override engine max_num_batched_tokens. Useful to rule out "
+            "chunked-prefill scheduling artifacts at large batch sizes. "
+            "Mirrors benchmark_thinker_engine.py."
+        ),
+    )
     parser.add_argument("--output-json", type=Path)
     parser.add_argument("--engine-log", type=Path)
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats <= 0:
         parser.error("repeats must be positive; warmup non-negative")
+    if args.max_num_seqs is not None and args.max_num_seqs <= 0:
+        parser.error("--max-num-seqs must be positive")
+    if args.max_num_batched_tokens is not None and args.max_num_batched_tokens <= 0:
+        parser.error("--max-num-batched-tokens must be positive")
     return args
 
 
@@ -217,8 +240,15 @@ def main() -> None:
         "batch_timeout": args.batch_timeout,
         "log_stats": True,
     }
-    if args.enforce_eager:
-        init_kwargs["stage_overrides"] = {"0": {"enforce_eager": True}}
+    if args.enforce_eager or args.max_num_seqs is not None or args.max_num_batched_tokens is not None:
+        overrides: dict[str, Any] = {}
+        if args.enforce_eager:
+            overrides["enforce_eager"] = True
+        if args.max_num_seqs is not None:
+            overrides["max_num_seqs"] = args.max_num_seqs
+        if args.max_num_batched_tokens is not None:
+            overrides["max_num_batched_tokens"] = args.max_num_batched_tokens
+        init_kwargs["stage_overrides"] = {"0": overrides}
 
     init_event = {"event": "initializing_engine", "deploy_config": str(args.deploy_config)}
     print(json.dumps(init_event, sort_keys=True), flush=True)
@@ -243,6 +273,8 @@ def main() -> None:
         "model": str(args.model),
         "deploy_config": str(args.deploy_config),
         "enforce_eager": args.enforce_eager,
+        "max_num_seqs_override": args.max_num_seqs,
+        "max_num_batched_tokens_override": args.max_num_batched_tokens,
         "stage_config": stages_snapshot,
         "num_stages": omni.num_stages,
         "batch_sizes": batch_sizes,

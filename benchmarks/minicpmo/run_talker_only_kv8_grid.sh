@@ -17,7 +17,7 @@ REPEATS=3
 COMMON_KV="--kv-lengths $KV --talker-min-tokens $MIN_TOKENS --warmup $WARMUP --repeats $REPEATS"
 
 run_one() {
-  local gpu=$1 bs=$2 label=$4
+  local gpu=$1 bs=$2
   local json="$OUT/talker_kv8_gpu${gpu}_bs${bs}.json"
   local log="$OUT/talker_kv8_gpu${gpu}_bs${bs}.log"
   echo "==> GPU$gpu bs=$bs"
